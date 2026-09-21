@@ -4,9 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-gpui = { version = "0.2.2", default-features = false, features = ["wayland"], git = "https://github.com/zed-industries/zed.git" }
+gpui = { 
+		version = "0.2.2", 
+		default-features = false, 
+		features = ["wayland"],
+		git = "https://github.com/zed-industries/zed.git", 
+		rev = "af431aeef42704f277cda75aa9cf48b0778a7994"
+}
 gpui_platform = {
 		version = "0.1.0",
     features = ["wayland"],
     git = "https://github.com/zed-industries/zed.git",
+		rev = "af431aeef42704f277cda75aa9cf48b0778a7994"
 }

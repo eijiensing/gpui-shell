@@ -30,47 +30,57 @@
         mesa
       ];
 
-      runtimeLibraryPath =
-        pkgs.lib.makeLibraryPath runtimeLibs
-        + ":/run/opengl-driver/lib";
+      runtimeLibraryPath = pkgs.lib.makeLibraryPath runtimeLibs + ":/run/opengl-driver/lib";
 
-    in {
-      packages.${system}.default =
-        pkgs.rustPlatform.buildRustPackage {
-          pname = "gpui-shell";
-          version = "0.1.0";
+    in
+    {
+      packages.${system}.default = pkgs.rustPlatform.buildRustPackage {
+        pname = "gpui-shell";
+        version = "0.1.0";
 
-          src = ./.;
+        src = ./.;
 
-          cargoLock = {
-            lockFile = ./Cargo.lock;
+        cargoLock = {
+          lockFile = ./Cargo.lock;
+          outputHashes = {
+            "collections-0.1.0" = "sha256-KIdwv14mh8ugwjswEotTEqNcuHChxwIWOp2biwa4jlM=";
+            "wasm_thread-0.3.3" = "sha256-+lRLCIk0S6Y5ORYjDKsYYHia2FtoSoh+rWkQh7mnPBE=";
+            "zed-font-kit-0.14.1-zed" = "sha256-KXygi0olNQi5yM8eaJVykNDtbPMDjT+cWPBF8UrtXR4=";
           };
-
-          nativeBuildInputs = with pkgs; [
-            pkg-config
-          ];
-
-          buildInputs = with pkgs; [
-            fontconfig
-            libxkbcommon
-          ] ++ runtimeLibs;
-
-          postInstall = ''
-            wrapProgram $out/bin/gpui-shell \
-              --set LD_LIBRARY_PATH "${runtimeLibraryPath}"
-          '';
         };
 
-      devShells.${system}.default = pkgs.mkShell {
-        buildInputs = with pkgs; [
-          cargo
-          rustc
-          rust-analyzer
-          rustfmt
+        nativeBuildInputs = with pkgs; [
           pkg-config
-          fontconfig
-          libxkbcommon
-        ] ++ runtimeLibs;
+          makeWrapper
+        ];
+
+        buildInputs =
+          with pkgs;
+          [
+            fontconfig
+            libxkbcommon
+          ]
+          ++ runtimeLibs;
+
+        postInstall = ''
+          wrapProgram $out/bin/gpui-shell \
+            --set LD_LIBRARY_PATH "${runtimeLibraryPath}"
+        '';
+      };
+
+      devShells.${system}.default = pkgs.mkShell {
+        buildInputs =
+          with pkgs;
+          [
+            cargo
+            rustc
+            rust-analyzer
+            rustfmt
+            pkg-config
+            fontconfig
+            libxkbcommon
+          ]
+          ++ runtimeLibs;
 
         shellHook = ''
           export LD_LIBRARY_PATH="${runtimeLibraryPath}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
