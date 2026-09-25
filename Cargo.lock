@@ -1921,6 +1921,7 @@ dependencies = [
 name = "gpui-shell"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "gpui",
  "gpui_platform",
 ]
