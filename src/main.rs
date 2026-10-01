@@ -3,8 +3,8 @@ use std::time::Duration;
 use chrono::Local;
 use gpui::layer_shell::{Anchor, LayerShellOptions};
 use gpui::{
-    App, Context, Render, Window, WindowBounds, WindowKind, WindowOptions, div, point, prelude::*,
-    px, size,
+    App, Context, Rems, Render, Window, WindowBounds, WindowKind, WindowOptions, div, point,
+    prelude::*, px, size,
 };
 use gpui_platform::application;
 
@@ -43,11 +43,11 @@ impl Island {
 impl Render for Island {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .w(px(64.0))
-            .h(px(16.0))
+            .w(px(48.0))
+            .h(px(12.0))
             .bg(gpui::black())
             .text_color(gpui::white())
-            .text_xs()
+            .text_size(Rems(0.5))
             .rounded_b_lg()
             .font_family("CaskaydiaMono")
             .flex()
@@ -91,12 +91,12 @@ fn open_bar_window(cx: &mut App, display_id: Option<gpui::DisplayId>) {
             display_id,
             window_bounds: Some(WindowBounds::Windowed(gpui::Bounds::new(
                 point(px(0.0), px(0.0)),
-                size(px(64.0), px(16.0)),
+                size(px(48.0), px(12.0)),
             ))),
             kind: WindowKind::LayerShell(LayerShellOptions {
                 layer: gpui::layer_shell::Layer::Top,
                 anchor: Anchor::TOP,
-                exclusive_zone: Some(px(8.0)),
+                exclusive_zone: None, //Some(px(8.0)),
                 ..Default::default()
             }),
             ..Default::default()
