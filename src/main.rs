@@ -1,10 +1,11 @@
+use std::collections::HashSet;
 use std::time::Duration;
 
 use chrono::Local;
 use gpui::layer_shell::{Anchor, LayerShellOptions};
 use gpui::{
-    App, Context, Rems, Render, Window, WindowBounds, WindowKind, WindowOptions, div, point,
-    prelude::*, px, size,
+    App, Context, DisplayId, Rems, Render, Window, WindowBounds, WindowKind, WindowOptions, div,
+    point, prelude::*, px,
 };
 use gpui_platform::application;
 
@@ -59,49 +60,51 @@ impl Render for Island {
 
 fn main() {
     application().run(|cx: &mut App| {
+        // Run a polling loop to reconcile open windows with active displays
         cx.spawn(|cx: &mut gpui::AsyncApp| {
             let cx = cx.clone();
             async move {
-                cx.background_executor()
-                    .timer(Duration::from_millis(100))
-                    .await;
+                let mut active_displays: HashSet<DisplayId> = HashSet::new();
 
-                cx.update(|cx: &mut App| {
-                    let displays = cx.displays();
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(500))
+                        .await;
 
-                    if displays.is_empty() {
-                        open_bar_window(cx, None);
-                    } else {
-                        for display in displays {
-                            open_bar_window(cx, Some(display.id()));
+                    cx.update(|cx: &mut App| {
+                        let current_displays: HashSet<DisplayId> =
+                            cx.displays().into_iter().map(|d| d.id()).collect();
+
+                        // Open windows on newly connected displays
+                        for &display_id in current_displays.difference(&active_displays) {
+                            open_bar_window(cx, Some(display_id));
                         }
-                    }
 
-                    cx.activate(true);
-                })
+                        active_displays = current_displays;
+                    });
+                }
             }
         })
         .detach();
     });
 }
 
-fn open_bar_window(cx: &mut App, display_id: Option<gpui::DisplayId>) {
-    cx.open_window(
+fn open_bar_window(cx: &mut App, display_id: Option<DisplayId>) {
+    let _ = cx.open_window(
         WindowOptions {
             display_id,
             window_bounds: Some(WindowBounds::Windowed(gpui::Bounds::new(
                 point(px(0.0), px(0.0)),
-                size(px(48.0), px(12.0)),
+                gpui::size(px(48.0), px(12.0)),
             ))),
             kind: WindowKind::LayerShell(LayerShellOptions {
                 layer: gpui::layer_shell::Layer::Top,
                 anchor: Anchor::TOP,
-                exclusive_zone: None, //Some(px(8.0)),
+                exclusive_zone: None,
                 ..Default::default()
             }),
             ..Default::default()
         },
         |_window, cx| cx.new(|cx| Island::new(cx)),
-    )
-    .unwrap();
+    );
 }
