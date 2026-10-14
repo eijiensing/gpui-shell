@@ -40,6 +40,10 @@
 
         src = ./.;
 
+        env = {
+          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+        };
+
         cargoLock = {
           lockFile = ./Cargo.lock;
           outputHashes = {
@@ -52,6 +56,8 @@
         nativeBuildInputs = with pkgs; [
           pkg-config
           makeWrapper
+          clang
+          llvmPackages.libclang
         ];
 
         buildInputs =
@@ -59,6 +65,7 @@
           [
             fontconfig
             libxkbcommon
+            pipewire
           ]
           ++ runtimeLibs;
 
@@ -79,11 +86,15 @@
             pkg-config
             fontconfig
             libxkbcommon
+            pipewire
+            clang
+            llvmPackages.libclang
           ]
           ++ runtimeLibs;
 
         shellHook = ''
-          export LD_LIBRARY_PATH="${runtimeLibraryPath}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+					export LD_LIBRARY_PATH="${runtimeLibraryPath}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+					export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
         '';
       };
     };

@@ -1,5 +1,6 @@
 mod animation;
 mod appearance;
+mod audio;
 mod cli;
 mod client;
 mod ipc;
