@@ -7,6 +7,7 @@ edition = "2024"
 async-channel = "2.5.0"
 chrono = "0.4.45"
 clap = { version = "4.6.7", features = ["derive"] }
+freedesktop-desktop-entry = { version = "0.8.3", default-features = false }
 gpui = {
 		version = "0.2.2",
 		default-features = false,

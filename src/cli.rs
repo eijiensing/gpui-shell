@@ -28,6 +28,11 @@ pub enum Command {
         #[arg(value_parser = parse_color)]
         color: Hsla,
     },
+
+    /// Expand the island into an application launcher.
+    ///
+    /// Invoking this while the launcher is already open does nothing.
+    Launcher,
 }
 
 /// Parses `#rgb`, `#rgba`, `#rrggbb`, or `#rrggbbaa` into a color.

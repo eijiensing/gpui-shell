@@ -2,17 +2,19 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use gpui::layer_shell::{Anchor, LayerShellOptions};
+use gpui::layer_shell::{Anchor, KeyboardInteractivity, LayerShellOptions};
 use gpui::{
-    App, AppContext, DisplayId, Pixels, Size, WindowBounds, WindowKind, WindowOptions, point, px,
+    App, AppContext, DisplayId, Pixels, Size, WindowBounds, WindowHandle, WindowKind,
+    WindowOptions, point, px,
 };
 use gpui_platform::application;
 
 use crate::animation::Animator;
-use crate::appearance::Settings;
+use crate::appearance::{IslandMode, Settings};
 use crate::cli::{Cli, Command};
 use crate::ipc;
-use crate::island::Island;
+use crate::island::{Island, IslandRole};
+use crate::launcher::Catalog;
 
 /// Animator wake-up cadence.
 const FRAME: Duration = Duration::from_millis(16);
@@ -38,18 +40,25 @@ pub fn run() {
         }
     });
 
+    // Walk the desktop-entry locations once, before any window exists, so the
+    // launcher never touches the filesystem from the render path.
+    let catalog = Catalog::discover();
+
     application().run(move |cx: &mut App| {
-        cx.set_global(Settings::default());
-
-        // Wakes the animator whenever a command changes the target appearance.
+        // The wake channel drives the animation loop; a handle to it lives in
+        // `Settings` so views can retarget the springs too (e.g. when closing).
         let (wake_tx, wake_rx) = async_channel::bounded::<()>(1);
+        cx.set_global(Settings::new(wake_tx));
+        cx.set_global(catalog);
 
-        // Consume commands, moving the target appearance.
+        // Consume commands, moving the target appearance or mode.
         cx.spawn(async move |cx| {
             while let Ok(command) = command_rx.recv().await {
-                cx.update(|cx| apply_command(cx, command));
-                // Bounded to one: extra wakes are coalesced.
-                wake_tx.try_send(()).ok();
+                cx.update(|cx| {
+                    apply_command(cx, command);
+                    // Bounded to one: extra wakes are coalesced.
+                    cx.global::<Settings>().request_animation();
+                });
             }
         })
         .detach();
@@ -87,13 +96,20 @@ pub fn run() {
 
                 // The surface is kept large enough to fit the island while it
                 // animates; shrink it to the target once the island has settled.
-                let shrink = cx.update(|cx| {
+                // Once a closing launcher has contracted, its transient surface
+                // is removed entirely so the bar underneath takes over.
+                let (shrink, remove_launcher) = cx.update(|cx| {
                     let settings = cx.global_mut::<Settings>();
-                    (settings.window_size != settings.target.size).then(|| {
+                    let closing = settings.mode == IslandMode::Normal;
+                    let shrink = (settings.window_size != settings.target.size).then(|| {
                         settings.window_size = settings.target.size;
                         settings.target.size
-                    })
+                    });
+                    (shrink, closing)
                 });
+                if remove_launcher {
+                    cx.update(remove_launcher_window);
+                }
                 if let Some(size) = shrink {
                     cx.update(|cx| resize_windows(cx, size));
                 }
@@ -115,7 +131,7 @@ pub fn run() {
                             cx.displays().into_iter().map(|d| d.id()).collect();
 
                         for &display_id in current.difference(&active_displays) {
-                            open_bar_window(cx, Some(display_id));
+                            let _ = open_bar_window(cx, Some(display_id));
                         }
 
                         active_displays = current;
@@ -127,29 +143,114 @@ pub fn run() {
     });
 }
 
-/// Updates the target appearance, growing the surface immediately for a resize.
+/// Updates the target state in response to a command.
 fn apply_command(cx: &mut App, command: Command) {
     match command {
         Command::Resize { width, height } => {
+            // `resize` redefines the compact size, not the launcher's.
             let new_size = Size::new(px(width), px(height));
-
-            // Size the surface now (a single resize call), with headroom for the
-            // spring overshoot, so the animating island is never clipped.
-            let (surface, changed) = {
+            {
                 let settings = cx.global_mut::<Settings>();
-                let surface = surface_size(settings.current.size, new_size);
-                let changed = surface != settings.window_size;
-                settings.window_size = surface;
-                (surface, changed)
-            };
-            if changed {
-                resize_windows(cx, surface);
+                settings.normal_size = new_size;
+                let target = settings.target_size();
+                settings.target.size = target;
             }
-
-            cx.global_mut::<Settings>().target.size = new_size;
+            grow_surface(cx);
         }
         Command::Color { color } => cx.global_mut::<Settings>().target.background = color,
         Command::TextColor { color } => cx.global_mut::<Settings>().target.text_color = color,
+        Command::Launcher => open_launcher(cx),
+    }
+}
+
+/// Switches to launcher mode and expands the island.
+///
+/// Requesting the launcher while it is already open is a no-op, so repeated
+/// invocations are predictable.
+fn open_launcher(cx: &mut App) {
+    if cx.global::<Settings>().mode == IslandMode::Launcher {
+        return;
+    }
+
+    {
+        let settings = cx.global_mut::<Settings>();
+        settings.mode = IslandMode::Launcher;
+        let target = settings.target_size();
+        settings.target.size = target;
+    }
+    grow_surface(cx);
+
+    // A dedicated surface with no output lets the compositor place the launcher
+    // on the focused display - the same NULL-output trick fuzzel uses. Re-use
+    // it if a previous close is still animating away.
+    let window = launcher_window(cx).or_else(|| open_launcher_window(cx));
+    if let Some(window) = window {
+        window
+            .update(cx, |island, _window, cx| island.prepare_launcher(cx))
+            .ok();
+    }
+}
+
+/// Leaves launcher mode and springs back to the normal size.
+///
+/// Every exit path funnels through here - a successful launch, Escape, or a
+/// failed launch - so the island can't be left expanded or holding the
+/// keyboard. The transient launcher surface is removed by the animator once it
+/// has contracted.
+pub(crate) fn close_launcher(cx: &mut App) {
+    if cx.global::<Settings>().mode != IslandMode::Launcher {
+        return;
+    }
+
+    {
+        let settings = cx.global_mut::<Settings>();
+        settings.mode = IslandMode::Normal;
+        let target = settings.target_size();
+        settings.target.size = target;
+    }
+
+    cx.global::<Settings>().request_animation();
+    cx.refresh_windows();
+}
+
+/// All open island windows: the per-display bars and, while open, the launcher.
+fn island_windows(cx: &App) -> Vec<WindowHandle<Island>> {
+    cx.windows()
+        .into_iter()
+        .filter_map(|window| window.downcast::<Island>())
+        .collect()
+}
+
+/// The transient launcher surface, if it exists.
+fn launcher_window(cx: &App) -> Option<WindowHandle<Island>> {
+    island_windows(cx).into_iter().find(|window| {
+        window
+            .read(cx)
+            .map(|island| island.role() == IslandRole::Launcher)
+            .unwrap_or(false)
+    })
+}
+
+/// Removes the transient launcher surface once it is no longer needed.
+fn remove_launcher_window(cx: &mut App) {
+    if let Some(window) = launcher_window(cx) {
+        window
+            .update(cx, |_island, window, _cx| window.remove_window())
+            .ok();
+    }
+}
+
+/// Sizes the transparent surface for the island's upcoming animation.
+fn grow_surface(cx: &mut App) {
+    let (surface, changed) = {
+        let settings = cx.global_mut::<Settings>();
+        let surface = surface_size(settings.current.size, settings.target.size);
+        let changed = surface != settings.window_size;
+        settings.window_size = surface;
+        (surface, changed)
+    };
+    if changed {
+        resize_windows(cx, surface);
     }
 }
 
@@ -163,23 +264,41 @@ fn surface_size(current: Size<Pixels>, target: Size<Pixels>) -> Size<Pixels> {
     )
 }
 
-/// Resizes every window surface to `size` in one call and requests a redraw.
+/// Resizes each island surface for its role and requests a redraw.
 fn resize_windows(cx: &mut App, size: Size<Pixels>) {
-    for handle in cx.windows() {
-        if let Some(handle) = handle.downcast::<Island>() {
-            handle
-                .update(cx, move |_island, window, _cx| window.resize(size))
-                .ok();
-        }
+    let (mode, normal_size) = {
+        let settings = cx.global::<Settings>();
+        (settings.mode, settings.normal_size)
+    };
+
+    for handle in island_windows(cx) {
+        let role = handle.read(cx).map(|island| island.role()).ok();
+        let target = match role {
+            // The launcher surface follows the animated size.
+            Some(IslandRole::Launcher) => size,
+            // Bars stay compact while the launcher owns the shared appearance.
+            Some(IslandRole::Bar) => {
+                if mode == IslandMode::Launcher {
+                    normal_size
+                } else {
+                    size
+                }
+            }
+            None => continue,
+        };
+
+        handle
+            .update(cx, move |_island, window, _cx| window.resize(target))
+            .ok();
     }
 
     cx.refresh_windows();
 }
 
-fn open_bar_window(cx: &mut App, display_id: Option<DisplayId>) {
+fn open_bar_window(cx: &mut App, display_id: Option<DisplayId>) -> Option<WindowHandle<Island>> {
     let window_size = cx.global::<Settings>().window_size;
 
-    let _ = cx.open_window(
+    cx.open_window(
         WindowOptions {
             display_id,
             window_bounds: Some(WindowBounds::Windowed(gpui::Bounds::new(
@@ -190,10 +309,43 @@ fn open_bar_window(cx: &mut App, display_id: Option<DisplayId>) {
                 layer: gpui::layer_shell::Layer::Top,
                 anchor: Anchor::TOP,
                 exclusive_zone: None,
+                // The bar never competes for the keyboard.
+                keyboard_interactivity: KeyboardInteractivity::None,
                 ..Default::default()
             }),
             ..Default::default()
         },
-        |_window, cx| cx.new(|cx| Island::new(cx)),
-    );
+        |_window, cx| cx.new(|cx| Island::new(IslandRole::Bar, cx)),
+    )
+    .ok()
+}
+
+/// Creates the transient launcher surface on the compositor's focused output.
+///
+/// Passing no output to the layer surface lets the compositor choose one; niri
+/// resolves that to its active output, matching fuzzel's behaviour.
+fn open_launcher_window(cx: &mut App) -> Option<WindowHandle<Island>> {
+    let window_size = cx.global::<Settings>().window_size;
+
+    cx.open_window(
+        WindowOptions {
+            display_id: None,
+            window_bounds: Some(WindowBounds::Windowed(gpui::Bounds::new(
+                point(px(0.0), px(0.0)),
+                window_size,
+            ))),
+            kind: WindowKind::LayerShell(LayerShellOptions {
+                layer: gpui::layer_shell::Layer::Overlay,
+                anchor: Anchor::TOP,
+                exclusive_zone: None,
+                // Hold the keyboard even when focus-follows-mouse points at
+                // another window, like fuzzel's exclusive mode.
+                keyboard_interactivity: KeyboardInteractivity::Exclusive,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        |_window, cx| cx.new(|cx| Island::new(IslandRole::Launcher, cx)),
+    )
+    .ok()
 }

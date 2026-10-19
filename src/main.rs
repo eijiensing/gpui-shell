@@ -5,6 +5,7 @@ mod cli;
 mod client;
 mod ipc;
 mod island;
+mod launcher;
 mod server;
 
 use clap::Parser;

@@ -5,7 +5,7 @@ use crate::appearance::{Appearance, CHANNELS};
 /// An underdamped spring: `ζ = damping / (2·√(stiffness·mass)) ≈ 0.45`, which
 /// gives a visible bounce before settling. Raise `damping` toward `2·√k` for a
 /// calmer, critically damped feel.
-const SPRING: SpringConfig = SpringConfig::new(320.0, 16.0, 1.0);
+const SPRING: SpringConfig = SpringConfig::new(640.0, 32.0, 1.0);
 
 /// Per-channel settling tolerances: pixels for the size, unit fractions for the
 /// color channels (which live in `0..1`).

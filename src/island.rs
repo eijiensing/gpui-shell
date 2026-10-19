@@ -1,35 +1,211 @@
 use std::time::Duration;
 
 use chrono::Local;
-use gpui::{Context, Rems, Render, Window, div, prelude::*};
+use gpui::{
+    AnyElement, Context, FocusHandle, KeyDownEvent, Rems, Render, ScrollHandle, Window, div,
+    prelude::*, px,
+};
 
-use crate::appearance::Settings;
+use crate::appearance::{Appearance, IslandMode, Settings, launcher_size};
 use crate::audio::{self, Volume};
+use crate::launcher::Catalog;
 
 /// How long the volume stays on screen after the last change before the island
 /// shows the clock again.
 const VOLUME_HOLD: Duration = Duration::from_millis(2000);
 
+/// Fraction of the travel between the normal and expanded sizes at which the
+/// launcher content is considered hidden (below) or shown (above). Deriving
+/// visibility from the animated size keeps the content switch tied to the
+/// spring rather than to a separate timer.
+const REVEAL_EDGE: f32 = 0.35;
+
+/// Normal-mode content: the clock, or a transient volume indicator.
+enum NormalIndicator {
+    Clock,
+    Volume(Volume),
+}
+
+/// Launcher-specific interaction state, owned per window.
+struct Launcher {
+    /// Focus target for the search input.
+    focus: FocusHandle,
+    /// What the user has typed.
+    query: String,
+    /// Catalog indices matching `query`, in display order.
+    results: Vec<usize>,
+    /// Index into `results` of the highlighted row.
+    selected: usize,
+    /// Keeps the selected row in view.
+    scroll: ScrollHandle,
+    /// Message shown when launching fails.
+    error: Option<String>,
+}
+
+impl Launcher {
+    fn new(focus: FocusHandle) -> Self {
+        Self {
+            focus,
+            query: String::new(),
+            results: Vec::new(),
+            selected: 0,
+            scroll: ScrollHandle::new(),
+            error: None,
+        }
+    }
+}
+
 pub struct Island {
+    /// What this surface is for.
+    role: IslandRole,
+    /// Current wall-clock time, refreshed once a second.
     time: String,
-    /// Latest sink state, shown in place of the clock while `Some`.
-    volume: Option<Volume>,
-    /// Bumped on every change so a superseded revert timer can be ignored.
+    /// What normal mode shows right now.
+    indicator: NormalIndicator,
+    /// Bumped on every volume change so a superseded revert timer is ignored.
     generation: u64,
+    launcher: Launcher,
+}
+
+/// Which kind of surface an [`Island`] drives.
+///
+/// [`IslandRole::Bar`] surfaces exist for every display and only ever show the
+/// compact clock. [`IslandRole::Launcher`] is a transient surface created on the
+/// compositor's focused output while the launcher is open, so it can expand and
+/// take keyboard focus without disturbing the bars.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum IslandRole {
+    Bar,
+    Launcher,
 }
 
 impl Island {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(role: IslandRole, cx: &mut Context<Self>) -> Self {
         let island = Self {
+            role,
             time: Local::now().format("%H:%M").to_string(),
-            volume: None,
+            indicator: NormalIndicator::Clock,
             generation: 0,
+            launcher: Launcher::new(cx.focus_handle()),
         };
 
         island.start_timer(cx);
         island.watch_volume(cx);
 
         island
+    }
+
+    pub fn role(&self) -> IslandRole {
+        self.role
+    }
+
+    /// Resets the launcher for a fresh search. Called on the transient launcher
+    /// surface when the launcher mode is requested.
+    pub fn prepare_launcher(&mut self, cx: &mut Context<Self>) {
+        self.launcher.query.clear();
+        self.launcher.selected = 0;
+        self.launcher.scroll = ScrollHandle::new();
+        self.launcher.error = None;
+        self.launcher.results = cx.global::<Catalog>().search("");
+        cx.notify();
+    }
+
+    /// Asks the server to leave launcher mode.
+    ///
+    /// Deferred because leaving launcher mode re-creates the layer surface (to
+    /// hand keyboard interactivity back), and that must not run while this
+    /// window is borrowed.
+    fn request_close(&mut self, cx: &mut Context<Self>) {
+        self.launcher.error = None;
+        cx.defer(crate::server::close_launcher);
+    }
+
+    /// Recomputes the filtered results for the current query and selects the
+    /// first match.
+    fn refilter(&mut self, cx: &mut Context<Self>) {
+        self.launcher.results = cx.global::<Catalog>().search(&self.launcher.query);
+        self.launcher.selected = 0;
+        self.launcher.scroll = ScrollHandle::new();
+        cx.notify();
+    }
+
+    /// Moves the highlighted row by `delta`, clamped to the result list.
+    fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let len = self.launcher.results.len();
+        if len == 0 {
+            return;
+        }
+
+        let current = self.launcher.selected.min(len - 1) as isize;
+        let next = (current + delta).clamp(0, len as isize - 1) as usize;
+        self.launcher.selected = next;
+        self.launcher.scroll.scroll_to_item(next);
+        cx.notify();
+    }
+
+    /// Launches the highlighted application and closes the launcher.
+    fn launch_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(&index) = self.launcher.results.get(self.launcher.selected) else {
+            return;
+        };
+
+        // Resolve the entry and spawn it while only holding an immutable borrow
+        // of the app context, so the launcher can then be closed.
+        let outcome = {
+            let catalog = cx.global::<Catalog>();
+            match catalog.entry(index) {
+                Some(entry) => (entry.name.clone(), entry.launch()),
+                None => return,
+            }
+        };
+
+        match outcome.1 {
+            Ok(()) => self.request_close(cx),
+            Err(err) => {
+                eprintln!("gpui-shell: failed to launch {}: {err}", outcome.0);
+                self.launcher.error = Some(format!("Couldn't launch {}", outcome.0));
+                cx.notify();
+            }
+        }
+    }
+
+    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        // Keys arriving after the launcher has been closed are ignored.
+        if cx.global::<Settings>().mode != IslandMode::Launcher {
+            return;
+        }
+
+        let keystroke = &event.keystroke;
+        let control =
+            keystroke.modifiers.control || keystroke.modifiers.alt || keystroke.modifiers.platform;
+
+        match keystroke.key.as_str() {
+            "escape" => return self.request_close(cx),
+            "enter" => return self.launch_selected(cx),
+            "up" => return self.move_selection(-1, cx),
+            "down" => return self.move_selection(1, cx),
+            "backspace" => {
+                if self.launcher.query.pop().is_some() {
+                    self.refilter(cx);
+                }
+                return;
+            }
+            // Leave Tab to GPUI's focus navigation.
+            "tab" => return,
+            _ => {}
+        }
+
+        // Plain typing only; ignore shortcuts and control characters.
+        if control {
+            return;
+        }
+        if let Some(text) = keystroke.key_char.as_deref()
+            && !text.is_empty()
+            && !text.chars().any(char::is_control)
+        {
+            self.launcher.query.push_str(text);
+            self.refilter(cx);
+        }
     }
 
     /// Shows the default sink's volume, reverting to the clock shortly after
@@ -40,7 +216,7 @@ impl Island {
         cx.spawn(async move |island, cx| {
             while let Ok(volume) = volume_rx.recv().await {
                 let Ok(generation) = island.update(cx, |island, cx| {
-                    island.volume = Some(volume);
+                    island.indicator = NormalIndicator::Volume(volume);
                     island.generation = island.generation.wrapping_add(1);
                     cx.notify();
                     island.generation
@@ -56,7 +232,7 @@ impl Island {
                         island
                             .update(cx, |island, cx| {
                                 if island.generation == generation {
-                                    island.volume = None;
+                                    island.indicator = NormalIndicator::Clock;
                                     cx.notify();
                                 }
                             })
@@ -77,50 +253,242 @@ impl Island {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
 
-                island
-                    .update(cx, |island, cx| {
-                        island.time = Local::now().format("%H:%M").to_string();
-                        cx.notify();
-                    })
-                    .ok();
+                // A window may be re-created (e.g. when keyboard interactivity
+                // changes); stop ticking once this island's entity is gone.
+                let updated = island.update(cx, |island, cx| {
+                    island.time = Local::now().format("%H:%M").to_string();
+                    cx.notify();
+                });
+                if updated.is_err() {
+                    break;
+                }
             }
         })
         .detach();
     }
+
+    /// The compact clock/volume view.
+    fn render_normal(&self) -> AnyElement {
+        let text = match &self.indicator {
+            NormalIndicator::Clock => self.time.clone(),
+            NormalIndicator::Volume(Volume::Muted) => "muted".to_string(),
+            NormalIndicator::Volume(Volume::Percent(percent)) => format!("{percent}%"),
+        };
+
+        div().child(text).into_any_element()
+    }
+
+    /// The expanded search view.
+    fn render_launcher(
+        &self,
+        progress: f32,
+        island: Appearance,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // Fade the whole view in and out with the resize so the content appears
+        // in step with the growing island.
+        let alpha = progress.clamp(0.0, 1.0);
+        let text = island.text_color.opacity(alpha);
+        let muted = island.text_color.opacity(alpha * 0.5);
+        let border = island.text_color.opacity(alpha * 0.25);
+        let selection = island.text_color.opacity(alpha * 0.15);
+
+        let catalog = cx.global::<Catalog>();
+        let has_query = !self.launcher.query.is_empty();
+
+        let input = div()
+            .id("launcher-input")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .w_full()
+            .h(px(36.0))
+            .px(px(10.0))
+            .flex_shrink_0()
+            .rounded_md()
+            .border_1()
+            .border_color(border)
+            .track_focus(&self.launcher.focus)
+            .on_key_down(cx.listener(Self::on_key_down))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(if has_query { text } else { muted })
+                    .child(if has_query {
+                        self.launcher.query.clone()
+                    } else {
+                        "Search applications…".to_string()
+                    }),
+            )
+            .child(div().w(px(1.5)).h(px(16.0)).bg(text));
+
+        let status = |message: String, cx_muted: gpui::Hsla| -> AnyElement {
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .flex_1()
+                .w_full()
+                .text_sm()
+                .text_color(cx_muted)
+                .child(message)
+                .into_any_element()
+        };
+
+        let body: AnyElement =
+            if let Some(error) = self.launcher.error.clone() {
+                status(error, muted)
+            } else if self.launcher.results.is_empty() {
+                let message = if has_query {
+                    "No matching applications".to_string()
+                } else {
+                    "No applications found".to_string()
+                };
+                status(message, muted)
+            } else {
+                let rows =
+                    self.launcher
+                        .results
+                        .iter()
+                        .enumerate()
+                        .map(|(row, &index)| {
+                            let Some(entry) = catalog.entry(index) else {
+                                return div().into_any_element();
+                            };
+                            let selected = row == self.launcher.selected;
+
+                            div()
+                                .flex()
+                                .flex_col()
+                                .w_full()
+                                .px(px(10.0))
+                                .py(px(6.0))
+                                .flex_shrink_0()
+                                .rounded_md()
+                                .when(selected, |row| row.bg(selection))
+                                .child(div().text_sm().text_color(text).child(entry.name.clone()))
+                                .children(entry.comment.clone().map(|comment| {
+                                    div().text_xs().text_color(muted).child(comment)
+                                }))
+                                .into_any_element()
+                        });
+
+                div()
+                    .id("launcher-results")
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .w_full()
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.launcher.scroll)
+                    .children(rows)
+                    .into_any_element()
+            };
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .size_full()
+            .p(px(10.0))
+            .child(input)
+            .child(body)
+            .into_any_element()
+    }
+}
+
+/// How far the island has travelled from the normal size towards the expanded
+/// launcher size, in `0..=1`.
+fn launcher_progress(settings: &Settings) -> f32 {
+    let normal = f32::from(settings.normal_size.height);
+    let expanded = f32::from(launcher_size().height);
+    let current = f32::from(settings.current.size.height);
+
+    if expanded <= normal {
+        return 0.0;
+    }
+
+    ((current - normal) / (expanded - normal)).clamp(0.0, 1.0)
 }
 
 impl Render for Island {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let settings = cx.global::<Settings>();
-        let window_size = settings.window_size;
-        let island = settings.current;
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (window_size, island, mode, normal_size, progress) = {
+            let settings = cx.global::<Settings>();
+            (
+                settings.window_size,
+                settings.current,
+                settings.mode,
+                settings.normal_size,
+                launcher_progress(settings),
+            )
+        };
+
+        // `true` from the moment the launcher starts opening until the island
+        // has contracted back past the reveal edge.
+        let launcher_active = mode == IslandMode::Launcher || progress > REVEAL_EDGE;
+
+        // Only the transient launcher surface is interactive.
+        if self.role == IslandRole::Launcher
+            && mode == IslandMode::Launcher
+            && !self.launcher.focus.is_focused(window)
+        {
+            let focus = self.launcher.focus.clone();
+            window.defer(cx, move |window, cx| focus.focus(window, cx));
+        }
+
+        // Bar surfaces stay compact and keep showing the clock while another
+        // display hosts the launcher. The launcher surface follows the animated
+        // size and swaps back to the clock at the end of the closing animation.
+        let (surface_size, box_size, content): (_, _, AnyElement) = match self.role {
+            IslandRole::Bar => {
+                let surface = if launcher_active {
+                    normal_size
+                } else {
+                    window_size
+                };
+                let box_size = if launcher_active {
+                    normal_size
+                } else {
+                    island.size
+                };
+                (surface, box_size, self.render_normal())
+            }
+            IslandRole::Launcher => {
+                let content = if launcher_active {
+                    self.render_launcher(progress, island, cx)
+                } else {
+                    self.render_normal()
+                };
+                (window_size, island.size, content)
+            }
+        };
 
         // The surface is transparent around the island, so we fill it with a
         // transparent layout and draw the (animated) island inside it, centered
         // horizontally and pinned to the top.
         div()
-            .w(window_size.width)
-            .h(window_size.height)
+            .w(surface_size.width)
+            .h(surface_size.height)
             .flex()
             .justify_center()
             .items_start()
             .child(
                 div()
-                    .w(island.size.width)
-                    .h(island.size.height)
+                    .w(box_size.width)
+                    .h(box_size.height)
                     .bg(island.background)
                     .text_color(island.text_color)
                     .text_size(Rems(0.5))
                     .rounded_b_lg()
                     .font_family("CaskaydiaMono")
+                    .overflow_hidden()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(match self.volume {
-                        Some(Volume::Muted) => "muted".to_string(),
-                        Some(Volume::Percent(percent)) => format!("{percent}%"),
-                        None => self.time.clone(),
-                    }),
+                    .child(content),
             )
     }
 }

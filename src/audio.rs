@@ -96,9 +96,11 @@ impl Volumes {
         }
         self.last_sent = Some(volume);
 
-        let subscribers = self.subscribers.lock().unwrap();
+        let mut subscribers = self.subscribers.lock().unwrap();
+        // Windows can be re-created, so drop subscribers whose receiver is gone.
+        subscribers.retain(|sender| !sender.is_closed());
         for sender in subscribers.iter() {
-            // Only fails once the receiver has been dropped.
+            // Only fails if the receiver is dropped between the prune and here.
             let _ = sender.try_send(volume);
         }
     }
