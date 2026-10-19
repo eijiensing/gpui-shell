@@ -3,6 +3,7 @@ mod appearance;
 mod audio;
 mod cli;
 mod client;
+mod easing;
 mod ipc;
 mod island;
 mod launcher;

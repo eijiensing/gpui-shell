@@ -14,7 +14,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum Command {
-    /// Resize the island; the background springs to the new size.
+    /// Resize the island; it eases to the new size.
     Resize { width: f32, height: f32 },
 
     /// Set the background color, e.g. `#00ff88`.

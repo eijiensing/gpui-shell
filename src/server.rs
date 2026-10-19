@@ -20,10 +20,8 @@ use crate::launcher::Catalog;
 const FRAME: Duration = Duration::from_millis(16);
 /// How often to look for newly connected displays.
 const DISPLAY_POLL: Duration = Duration::from_millis(500);
-/// Safety cap so a spring can never animate forever.
+/// Safety cap so an animation can never run forever.
 const MAX_ANIMATION: Duration = Duration::from_secs(5);
-/// Extra surface size so the island's spring overshoot isn't clipped.
-const OVERSHOOT_MARGIN: f32 = 0.35;
 
 pub fn run() {
     let (command_tx, command_rx) = async_channel::unbounded::<Command>();
@@ -46,7 +44,7 @@ pub fn run() {
 
     application().run(move |cx: &mut App| {
         // The wake channel drives the animation loop; a handle to it lives in
-        // `Settings` so views can retarget the springs too (e.g. when closing).
+        // `Settings` so views can retarget the animations too (e.g. when closing).
         let (wake_tx, wake_rx) = async_channel::bounded::<()>(1);
         cx.set_global(Settings::new(wake_tx));
         cx.set_global(catalog);
@@ -63,7 +61,8 @@ pub fn run() {
         })
         .detach();
 
-        // Animate `current` towards `target` with springs.
+        // Animate `current` towards `target` with an eased resize and springs
+        // for the colors.
         cx.spawn(async move |cx| {
             let mut animator = cx.update(|cx| Animator::new(cx.global::<Settings>().current));
 
@@ -191,7 +190,7 @@ fn open_launcher(cx: &mut App) {
     }
 }
 
-/// Leaves launcher mode and springs back to the normal size.
+/// Leaves launcher mode and eases back to the normal size.
 ///
 /// Every exit path funnels through here - a successful launch, Escape, or a
 /// failed launch - so the island can't be left expanded or holding the
@@ -254,13 +253,12 @@ fn grow_surface(cx: &mut App) {
     }
 }
 
-/// Surface size big enough to hold the island as it springs from `current` to
-/// `target`, including the overshoot the spring adds on the way.
+/// Surface size big enough to hold the island as it eases from `current` to
+/// `target`.
 fn surface_size(current: Size<Pixels>, target: Size<Pixels>) -> Size<Pixels> {
-    let headroom = 1.0 + OVERSHOOT_MARGIN;
     Size::new(
-        px(f32::from(current.width).max(f32::from(target.width) * headroom)),
-        px(f32::from(current.height).max(f32::from(target.height) * headroom)),
+        px(f32::from(current.width).max(f32::from(target.width))),
+        px(f32::from(current.height).max(f32::from(target.height))),
     )
 }
 

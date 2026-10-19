@@ -1,7 +1,7 @@
 use gpui::{Global, Hsla, Pixels, Size, px};
 
-/// Number of scalar channels a spring animates: the two size components and the
-/// hue/saturation/lightness/alpha of each color.
+/// Number of scalar channels the animator drives: the two size components and
+/// the hue/saturation/lightness/alpha of each color.
 pub const CHANNELS: usize = 10;
 
 /// Compact size used by normal mode when `resize` hasn't overridden it.
@@ -16,8 +16,8 @@ pub fn launcher_size() -> Size<Pixels> {
 
 /// What the island is showing.
 ///
-/// The mode selects which content is drawn and which target size the springs
-/// head towards. It is intentionally separate from the animation that carries
+/// The mode selects which content is drawn and which target size the animation
+/// heads towards. It is intentionally separate from the animation that carries
 /// the island between sizes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum IslandMode {
@@ -49,7 +49,7 @@ impl Default for Appearance {
 }
 
 impl Appearance {
-    /// Flattens the appearance into the scalar channels the animator springs.
+    /// Flattens the appearance into the scalar channels the animator drives.
     pub fn to_channels(self) -> [f32; CHANNELS] {
         [
             f32::from(self.size.width),
@@ -92,7 +92,7 @@ pub struct Settings {
     pub window_size: Size<Pixels>,
     /// Appearance currently drawn (driven by the animator).
     pub current: Appearance,
-    /// Appearance the springs are heading towards.
+    /// Appearance the animations are heading towards.
     pub target: Appearance,
     /// Content mode the island is (or is settling towards).
     pub mode: IslandMode,
@@ -126,7 +126,7 @@ impl Settings {
         }
     }
 
-    /// Poke the spring animator so it starts moving `current` towards `target`.
+    /// Poke the animator so it starts moving `current` towards `target`.
     ///
     /// The channel is bounded to one, so extra wakes are coalesced.
     pub fn request_animation(&self) {

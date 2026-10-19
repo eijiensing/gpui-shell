@@ -17,7 +17,7 @@ const VOLUME_HOLD: Duration = Duration::from_millis(2000);
 /// Fraction of the travel between the normal and expanded sizes at which the
 /// launcher content is considered hidden (below) or shown (above). Deriving
 /// visibility from the animated size keeps the content switch tied to the
-/// spring rather than to a separate timer.
+/// resize animation rather than to a separate timer.
 const REVEAL_EDGE: f32 = 0.35;
 
 /// Normal-mode content: the clock, or a transient volume indicator.
