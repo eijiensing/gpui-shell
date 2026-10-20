@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use gpui::{SpringConfig, SpringState};
 
 use crate::appearance::{Appearance, CHANNELS};
@@ -85,6 +87,75 @@ impl Animator {
     }
 }
 
+/// Global animation driver shared by every island window.
+///
+/// The animation is advanced from the render path, once per presented frame, so
+/// it is paced by the compositor's frame callbacks instead of a fixed timer.
+/// Progress is measured against wall-clock time, which keeps the motion correct
+/// when frames are dropped and keeps windows on different refresh rates in
+/// sync.
+pub struct Animation {
+    animator: Animator,
+    /// When the animator was last advanced; `None` until the first tick after a
+    /// request, so idle time never produces a jump.
+    last_tick: Option<Instant>,
+    running: bool,
+}
+
+impl gpui::Global for Animation {}
+
+impl Animation {
+    pub fn new(initial: Appearance) -> Self {
+        Self {
+            animator: Animator::new(initial),
+            last_tick: None,
+            running: false,
+        }
+    }
+
+    /// Marks the animation as in flight.
+    ///
+    /// The caller must also request a frame on at least one island window;
+    /// `tick` then advances the animation from that window's render path.
+    pub fn request(&mut self) {
+        if !self.running {
+            self.running = true;
+            self.last_tick = None;
+        }
+    }
+
+    /// Whether an animation is currently in flight.
+    pub fn running(&self) -> bool {
+        self.running
+    }
+
+    /// Advances towards `target` by the time elapsed since the previous tick.
+    ///
+    /// Returns the appearance to draw and whether the animation settled on this
+    /// tick. The first call after [`Self::request`] keeps the current appearance
+    /// (it uses a zero delta), so the starting state is presented before motion
+    /// begins.
+    pub fn tick(&mut self, target: Appearance, now: Instant) -> (Appearance, bool) {
+        if !self.running {
+            return (self.animator.value(), false);
+        }
+
+        let dt = self
+            .last_tick
+            .map(|last| now.saturating_duration_since(last).as_secs_f32())
+            .unwrap_or(0.0);
+        self.last_tick = Some(now);
+
+        if self.animator.advance(target, dt) {
+            self.animator.snap_to(target);
+            self.running = false;
+            (target, true)
+        } else {
+            (self.animator.value(), false)
+        }
+    }
+}
+
 /// A fixed-duration, eased interpolation between two sizes.
 struct SizeTween {
     /// The size currently drawn.
@@ -140,6 +211,8 @@ fn lerp(from: f32, to: f32, progress: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use gpui::{Size, px};
 
     use super::*;
@@ -186,5 +259,44 @@ mod tests {
         let second = with_size(100.0, 50.0);
         assert!(!animator.advance(second, 0.0));
         assert_eq!(animator.value().size, midway);
+    }
+
+    #[test]
+    fn first_tick_after_request_ignores_idle_time() {
+        let mut animation = Animation::new(with_size(48.0, 12.0));
+        animation.request();
+
+        // However long the app sat idle before the request, the first frame
+        // stays at the starting size instead of jumping ahead.
+        let now = Instant::now() + Duration::from_secs(10);
+        let (value, settled) = animation.tick(with_size(200.0, 100.0), now);
+
+        assert!(!settled);
+        assert_eq!(value.size, with_size(48.0, 12.0).size);
+        assert!(animation.running());
+    }
+
+    #[test]
+    fn ticks_are_paced_by_elapsed_time() {
+        let mut animation = Animation::new(with_size(48.0, 12.0));
+        let target = with_size(200.0, 100.0);
+        animation.request();
+
+        let start = Instant::now();
+        animation.tick(target, start); // retargets with a zero delta
+        let (value, settled) = animation.tick(
+            target,
+            start + Duration::from_secs_f32(RESIZE_DURATION / 2.0),
+        );
+
+        assert!(!settled);
+        assert!((f32::from(value.size.width) - 124.0).abs() < 0.01);
+
+        let (value, settled) =
+            animation.tick(target, start + Duration::from_secs_f32(RESIZE_DURATION));
+
+        assert!(settled);
+        assert_eq!(value.size, target.size);
+        assert!(!animation.running());
     }
 }

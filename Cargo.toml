@@ -22,3 +22,13 @@ gpui_platform = {
 		rev = "af431aeef42704f277cda75aa9cf48b0778a7994"
 }
 pipewire = "0.10.1"
+
+# gpui's layout, text shaping, and wgpu stack are too slow when built
+# unoptimized: animations visibly drop frames under `cargo run`. Optimize
+# dependencies in dev builds, and give the app itself a light optimization
+# while keeping incremental rebuilds fast and debug info available.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

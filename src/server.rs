@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use clap::Parser;
 use gpui::layer_shell::{Anchor, KeyboardInteractivity, LayerShellOptions};
@@ -9,19 +9,15 @@ use gpui::{
 };
 use gpui_platform::application;
 
-use crate::animation::Animator;
+use crate::animation::Animation;
 use crate::appearance::{IslandMode, Settings};
 use crate::cli::{Cli, Command};
 use crate::ipc;
 use crate::island::{Island, IslandRole};
 use crate::launcher::Catalog;
 
-/// Animator wake-up cadence.
-const FRAME: Duration = Duration::from_millis(16);
 /// How often to look for newly connected displays.
 const DISPLAY_POLL: Duration = Duration::from_millis(500);
-/// Safety cap so an animation can never run forever.
-const MAX_ANIMATION: Duration = Duration::from_secs(5);
 
 pub fn run() {
     let (command_tx, command_rx) = async_channel::unbounded::<Command>();
@@ -43,10 +39,8 @@ pub fn run() {
     let catalog = Catalog::discover();
 
     application().run(move |cx: &mut App| {
-        // The wake channel drives the animation loop; a handle to it lives in
-        // `Settings` so views can retarget the animations too (e.g. when closing).
-        let (wake_tx, wake_rx) = async_channel::bounded::<()>(1);
-        cx.set_global(Settings::new(wake_tx));
+        cx.set_global(Settings::new());
+        cx.set_global(Animation::new(cx.global::<Settings>().current));
         cx.set_global(catalog);
 
         // Consume commands, moving the target appearance or mode.
@@ -54,64 +48,8 @@ pub fn run() {
             while let Ok(command) = command_rx.recv().await {
                 cx.update(|cx| {
                     apply_command(cx, command);
-                    // Bounded to one: extra wakes are coalesced.
-                    cx.global::<Settings>().request_animation();
+                    start_animation(cx);
                 });
-            }
-        })
-        .detach();
-
-        // Animate `current` towards `target` with an eased resize and springs
-        // for the colors.
-        cx.spawn(async move |cx| {
-            let mut animator = cx.update(|cx| Animator::new(cx.global::<Settings>().current));
-
-            while wake_rx.recv().await.is_ok() {
-                let started = Instant::now();
-                let mut last = Instant::now();
-
-                loop {
-                    let dt = last.elapsed().as_secs_f32();
-                    last = Instant::now();
-
-                    let target = cx.update(|cx| cx.global::<Settings>().target);
-                    let settled = animator.advance(target, dt);
-                    let value = if settled { target } else { animator.value() };
-                    if settled {
-                        animator.snap_to(target);
-                    }
-
-                    cx.update(|cx| {
-                        cx.global_mut::<Settings>().current = value;
-                        cx.refresh_windows();
-                    });
-
-                    if settled || started.elapsed() >= MAX_ANIMATION {
-                        break;
-                    }
-
-                    cx.background_executor().timer(FRAME).await;
-                }
-
-                // The surface is kept large enough to fit the island while it
-                // animates; shrink it to the target once the island has settled.
-                // Once a closing launcher has contracted, its transient surface
-                // is removed entirely so the bar underneath takes over.
-                let (shrink, remove_launcher) = cx.update(|cx| {
-                    let settings = cx.global_mut::<Settings>();
-                    let closing = settings.mode == IslandMode::Normal;
-                    let shrink = (settings.window_size != settings.target.size).then(|| {
-                        settings.window_size = settings.target.size;
-                        settings.target.size
-                    });
-                    (shrink, closing)
-                });
-                if remove_launcher {
-                    cx.update(remove_launcher_window);
-                }
-                if let Some(size) = shrink {
-                    cx.update(|cx| resize_windows(cx, size));
-                }
             }
         })
         .detach();
@@ -208,8 +146,55 @@ pub(crate) fn close_launcher(cx: &mut App) {
         settings.target.size = target;
     }
 
-    cx.global::<Settings>().request_animation();
+    start_animation(cx);
+}
+
+/// Marks the shared animation as running and asks every island window to draw.
+///
+/// The redraw gets us into `Render`, where `request_animation_frame` can
+/// legally be called (it is restricted to the draw phase); from then on each
+/// rendered frame requests the next compositor frame until the animation
+/// settles. That pacing is what bypasses gpui's 30 fps throttle for inactive
+/// windows.
+fn start_animation(cx: &mut App) {
+    cx.global_mut::<Animation>().request();
+
+    for handle in island_windows(cx) {
+        // `on_next_frame` is safe outside the draw phase (unlike
+        // `request_animation_frame`) and guarantees an unthrottled frame. The
+        // render that follows schedules the rest of the animation from inside
+        // `Render`.
+        handle
+            .update(cx, |_island, window, _cx| window.on_next_frame(|_, _| {}))
+            .ok();
+    }
+
     cx.refresh_windows();
+}
+
+/// Settles the surfaces once the shared animation reaches its target.
+///
+/// The launcher surface is kept large enough to hold the island while it
+/// animates; this shrinks it back once the island has come to rest. A closing
+/// launcher's transient surface is then removed entirely so the bar underneath
+/// takes over.
+pub(crate) fn finish_animation(cx: &mut App) {
+    let (shrink, remove_launcher) = {
+        let settings = cx.global_mut::<Settings>();
+        let closing = settings.mode == IslandMode::Normal;
+        let shrink = (settings.window_size != settings.target.size).then(|| {
+            settings.window_size = settings.target.size;
+            settings.target.size
+        });
+        (shrink, closing)
+    };
+
+    if remove_launcher {
+        remove_launcher_window(cx);
+    }
+    if let Some(size) = shrink {
+        resize_windows(cx, size);
+    }
 }
 
 /// All open island windows: the per-display bars and, while open, the launcher.

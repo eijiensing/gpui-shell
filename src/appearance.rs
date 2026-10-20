@@ -11,7 +11,7 @@ pub fn default_normal_size() -> Size<Pixels> {
 
 /// Expanded size used by the application launcher.
 pub fn launcher_size() -> Size<Pixels> {
-    Size::new(px(420.0), px(300.0))
+    Size::new(px(420.0), px(600.0))
 }
 
 /// What the island is showing.
@@ -98,14 +98,12 @@ pub struct Settings {
     pub mode: IslandMode,
     /// Compact size used by normal mode; the `resize` command updates this.
     pub normal_size: Size<Pixels>,
-    /// Wakes the animation loop when the target changes.
-    wake: async_channel::Sender<()>,
 }
 
 impl Global for Settings {}
 
 impl Settings {
-    pub fn new(wake: async_channel::Sender<()>) -> Self {
+    pub fn new() -> Self {
         let appearance = Appearance::default();
         Self {
             window_size: appearance.size,
@@ -113,7 +111,6 @@ impl Settings {
             target: appearance,
             mode: IslandMode::Normal,
             normal_size: appearance.size,
-            wake,
         }
     }
 
@@ -124,12 +121,5 @@ impl Settings {
             // The calendar is not implemented; it reuses the normal size for now.
             IslandMode::Normal | IslandMode::Calendar => self.normal_size,
         }
-    }
-
-    /// Poke the animator so it starts moving `current` towards `target`.
-    ///
-    /// The channel is bounded to one, so extra wakes are coalesced.
-    pub fn request_animation(&self) {
-        self.wake.try_send(()).ok();
     }
 }

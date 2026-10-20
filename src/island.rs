@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Local;
 use gpui::{
@@ -6,6 +6,7 @@ use gpui::{
     prelude::*, px,
 };
 
+use crate::animation::Animation;
 use crate::appearance::{Appearance, IslandMode, Settings, launcher_size};
 use crate::audio::{self, Volume};
 use crate::launcher::Catalog;
@@ -32,6 +33,9 @@ struct Launcher {
     focus: FocusHandle,
     /// What the user has typed.
     query: String,
+    /// Whether Ctrl/Cmd+A has selected the whole query. The field has no
+    /// movable caret, so selection is all-or-nothing.
+    select_all: bool,
     /// Catalog indices matching `query`, in display order.
     results: Vec<usize>,
     /// Index into `results` of the highlighted row.
@@ -47,6 +51,7 @@ impl Launcher {
         Self {
             focus,
             query: String::new(),
+            select_all: false,
             results: Vec::new(),
             selected: 0,
             scroll: ScrollHandle::new(),
@@ -103,6 +108,7 @@ impl Island {
     /// surface when the launcher mode is requested.
     pub fn prepare_launcher(&mut self, cx: &mut Context<Self>) {
         self.launcher.query.clear();
+        self.launcher.select_all = false;
         self.launcher.selected = 0;
         self.launcher.scroll = ScrollHandle::new();
         self.launcher.error = None;
@@ -179,13 +185,25 @@ impl Island {
         let control =
             keystroke.modifiers.control || keystroke.modifiers.alt || keystroke.modifiers.platform;
 
+        // Select the whole query so the next keystroke replaces it. `secondary`
+        // is Ctrl on Linux and Cmd on macOS.
+        if keystroke.modifiers.secondary() && keystroke.key == "a" {
+            self.launcher.select_all = true;
+            cx.notify();
+            return;
+        }
+
         match keystroke.key.as_str() {
             "escape" => return self.request_close(cx),
             "enter" => return self.launch_selected(cx),
             "up" => return self.move_selection(-1, cx),
             "down" => return self.move_selection(1, cx),
             "backspace" => {
-                if self.launcher.query.pop().is_some() {
+                if self.launcher.select_all {
+                    self.launcher.select_all = false;
+                    self.launcher.query.clear();
+                    self.refilter(cx);
+                } else if self.launcher.query.pop().is_some() {
                     self.refilter(cx);
                 }
                 return;
@@ -203,6 +221,10 @@ impl Island {
             && !text.is_empty()
             && !text.chars().any(char::is_control)
         {
+            if self.launcher.select_all {
+                self.launcher.select_all = false;
+                self.launcher.query.clear();
+            }
             self.launcher.query.push_str(text);
             self.refilter(cx);
         }
@@ -296,12 +318,43 @@ impl Island {
         let catalog = cx.global::<Catalog>();
         let has_query = !self.launcher.query.is_empty();
 
+        let query = div()
+            .text_sm()
+            .whitespace_nowrap()
+            .text_color(if has_query { text } else { muted })
+            .min_w_0()
+            .overflow_hidden()
+            .when(has_query && self.launcher.select_all, |query| {
+                query.bg(selection).rounded_xs()
+            })
+            .child(if has_query {
+                self.launcher.query.clone()
+            } else {
+                "Search applications…".to_string()
+            });
+
+        let caret = div().flex_shrink_0().w(px(1.5)).h(px(16.0)).bg(text);
+
+        // With a placeholder, put the caret before the text so it sits at the
+        // start of the field instead of being pushed to the end of the hint.
+        let field = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .w_full()
+            .min_w_0()
+            .overflow_hidden();
+        let field = if has_query {
+            field.child(query).child(caret.ml(px(1.0)))
+        } else {
+            field.child(caret).child(query)
+        };
+
         let input = div()
             .id("launcher-input")
             .flex()
             .flex_row()
             .items_center()
-            .gap_1()
             .w_full()
             .h(px(36.0))
             .px(px(10.0))
@@ -311,17 +364,7 @@ impl Island {
             .border_color(border)
             .track_focus(&self.launcher.focus)
             .on_key_down(cx.listener(Self::on_key_down))
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(if has_query { text } else { muted })
-                    .child(if has_query {
-                        self.launcher.query.clone()
-                    } else {
-                        "Search applications…".to_string()
-                    }),
-            )
-            .child(div().w(px(1.5)).h(px(16.0)).bg(text));
+            .child(field);
 
         let status = |message: String, cx_muted: gpui::Hsla| -> AnyElement {
             div()
@@ -415,6 +458,22 @@ fn launcher_progress(settings: &Settings) -> f32 {
 
 impl Render for Island {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Advance the shared animation before building the tree so this frame
+        // draws the new position. While it is in flight, request the next frame
+        // from the compositor; this paces the animation on frame callbacks
+        // instead of a fixed timer, keeping it in step with presentation.
+        let target = cx.global::<Settings>().target;
+        let (animated, settled) = cx.global_mut::<Animation>().tick(target, Instant::now());
+        cx.global_mut::<Settings>().current = animated;
+
+        if settled {
+            // Surface bookkeeping must not mutate windows while this one is
+            // being drawn, so hand it to the next effect cycle.
+            cx.defer(crate::server::finish_animation);
+        } else if cx.global::<Animation>().running() {
+            window.request_animation_frame();
+        }
+
         let (window_size, island, mode, normal_size, progress) = {
             let settings = cx.global::<Settings>();
             (
