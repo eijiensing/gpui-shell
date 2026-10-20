@@ -474,7 +474,7 @@ impl Render for Island {
             window.request_animation_frame();
         }
 
-        let (window_size, island, mode, normal_size, progress) = {
+        let (window_size, island, mode, normal_size, progress, launcher_engaged) = {
             let settings = cx.global::<Settings>();
             (
                 settings.window_size,
@@ -482,6 +482,7 @@ impl Render for Island {
                 settings.mode,
                 settings.normal_size,
                 launcher_progress(settings),
+                settings.launcher_engaged,
             )
         };
 
@@ -503,15 +504,15 @@ impl Render for Island {
         // size and swaps back to the clock at the end of the closing animation.
         let (surface_size, box_size, content): (_, _, AnyElement) = match self.role {
             IslandRole::Bar => {
-                let surface = if launcher_active {
-                    normal_size
+                // Bars never follow a launcher resize. They stay compact until
+                // the closing animation has fully settled and the surface is
+                // handed back, otherwise they would briefly jump to the
+                // expanded surface size as the launcher shrinks past the
+                // reveal edge.
+                let (surface, box_size) = if launcher_engaged {
+                    (normal_size, normal_size)
                 } else {
-                    window_size
-                };
-                let box_size = if launcher_active {
-                    normal_size
-                } else {
-                    island.size
+                    (window_size, island.size)
                 };
                 (surface, box_size, self.render_normal())
             }

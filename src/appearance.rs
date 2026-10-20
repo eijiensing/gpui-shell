@@ -98,6 +98,12 @@ pub struct Settings {
     pub mode: IslandMode,
     /// Compact size used by normal mode; the `resize` command updates this.
     pub normal_size: Size<Pixels>,
+    /// Whether the launcher currently owns the shared appearance.
+    ///
+    /// Set when the launcher opens and cleared once its closing animation has
+    /// settled. Bar surfaces stay compact while this is set, so the launcher's
+    /// resize never reaches displays that are not hosting it.
+    pub launcher_engaged: bool,
 }
 
 impl Global for Settings {}
@@ -111,6 +117,7 @@ impl Settings {
             target: appearance,
             mode: IslandMode::Normal,
             normal_size: appearance.size,
+            launcher_engaged: false,
         }
     }
 

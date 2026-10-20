@@ -112,6 +112,7 @@ fn open_launcher(cx: &mut App) {
     {
         let settings = cx.global_mut::<Settings>();
         settings.mode = IslandMode::Launcher;
+        settings.launcher_engaged = true;
         let target = settings.target_size();
         settings.target.size = target;
     }
@@ -182,6 +183,11 @@ pub(crate) fn finish_animation(cx: &mut App) {
     let (shrink, remove_launcher) = {
         let settings = cx.global_mut::<Settings>();
         let closing = settings.mode == IslandMode::Normal;
+        if closing {
+            // The closing animation has settled, so the bars own the
+            // appearance again.
+            settings.launcher_engaged = false;
+        }
         let shrink = (settings.window_size != settings.target.size).then(|| {
             settings.window_size = settings.target.size;
             settings.target.size
