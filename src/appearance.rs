@@ -14,6 +14,11 @@ pub fn launcher_size() -> Size<Pixels> {
     Size::new(px(420.0), px(600.0))
 }
 
+/// Expanded size used by the StatusNotifierItem tray.
+pub fn tray_size() -> Size<Pixels> {
+    Size::new(px(480.0), px(600.0))
+}
+
 /// What the island is showing.
 ///
 /// The mode selects which content is drawn and which target size the animation
@@ -25,6 +30,8 @@ pub enum IslandMode {
     Normal,
     /// Expanded application search.
     Launcher,
+    /// Expanded StatusNotifierItem tray.
+    Tray,
     /// Reserved for a future calendar view; not implemented.
     #[allow(dead_code)]
     Calendar,
@@ -96,14 +103,26 @@ pub struct Settings {
     pub target: Appearance,
     /// Content mode the island is (or is settling towards).
     pub mode: IslandMode,
+    /// The overlay that is open, or was open most recently.
+    ///
+    /// Unlike [`Self::mode`] this is not reset to [`IslandMode::Normal`] when
+    /// closing starts, so the overlay content can stay visible while the island
+    /// contracts.
+    pub overlay_mode: IslandMode,
     /// Compact size used by normal mode; the `resize` command updates this.
     pub normal_size: Size<Pixels>,
-    /// Whether the launcher currently owns the shared appearance.
+    /// Size the currently open overlay is expanding to.
     ///
-    /// Set when the launcher opens and cleared once its closing animation has
-    /// settled. Bar surfaces stay compact while this is set, so the launcher's
-    /// resize never reaches displays that are not hosting it.
-    pub launcher_engaged: bool,
+    /// Kept while an overlay is open so the content fade can be derived from
+    /// the animated height even after the mode has flipped back to
+    /// [`IslandMode::Normal`] for the closing animation.
+    pub overlay_size: Size<Pixels>,
+    /// Whether an overlay currently owns the shared appearance.
+    ///
+    /// Set when the launcher or tray opens and cleared once its closing
+    /// animation has settled. Bar surfaces stay compact while this is set, so
+    /// the overlay's resize never reaches displays that are not hosting it.
+    pub overlay_engaged: bool,
 }
 
 impl Global for Settings {}
@@ -116,8 +135,10 @@ impl Settings {
             current: appearance,
             target: appearance,
             mode: IslandMode::Normal,
+            overlay_mode: IslandMode::Normal,
             normal_size: appearance.size,
-            launcher_engaged: false,
+            overlay_size: appearance.size,
+            overlay_engaged: false,
         }
     }
 
@@ -125,6 +146,7 @@ impl Settings {
     pub fn target_size(&self) -> Size<Pixels> {
         match self.mode {
             IslandMode::Launcher => launcher_size(),
+            IslandMode::Tray => tray_size(),
             // The calendar is not implemented; it reuses the normal size for now.
             IslandMode::Normal | IslandMode::Calendar => self.normal_size,
         }

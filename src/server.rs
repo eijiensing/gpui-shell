@@ -34,6 +34,10 @@ pub fn run() {
         }
     });
 
+    // Own the StatusNotifierWatcher (or attach to an existing one) before any
+    // application has a chance to register a tray item.
+    crate::status_notifier::start();
+
     // Walk the desktop-entry locations once, before any window exists, so the
     // launcher never touches the filesystem from the render path.
     let catalog = Catalog::discover();
@@ -84,7 +88,7 @@ pub fn run() {
 fn apply_command(cx: &mut App, command: Command) {
     match command {
         Command::Resize { width, height } => {
-            // `resize` redefines the compact size, not the launcher's.
+            // `resize` redefines the compact size, not the overlay's.
             let new_size = Size::new(px(width), px(height));
             {
                 let settings = cx.global_mut::<Settings>();
@@ -96,47 +100,55 @@ fn apply_command(cx: &mut App, command: Command) {
         }
         Command::Color { color } => cx.global_mut::<Settings>().target.background = color,
         Command::TextColor { color } => cx.global_mut::<Settings>().target.text_color = color,
-        Command::Launcher => open_launcher(cx),
+        Command::Launcher => open_overlay(cx, IslandMode::Launcher),
+        Command::Tray => open_overlay(cx, IslandMode::Tray),
     }
 }
 
-/// Switches to launcher mode and expands the island.
+/// Switches to an overlay mode and expands the island.
 ///
-/// Requesting the launcher while it is already open is a no-op, so repeated
-/// invocations are predictable.
-fn open_launcher(cx: &mut App) {
-    if cx.global::<Settings>().mode == IslandMode::Launcher {
+/// Requesting the mode that is already open is a no-op, so repeated invocations
+/// are predictable. Requesting the other overlay reuses the existing surface and
+/// swaps its content.
+fn open_overlay(cx: &mut App, mode: IslandMode) {
+    if cx.global::<Settings>().mode == mode {
         return;
     }
 
     {
         let settings = cx.global_mut::<Settings>();
-        settings.mode = IslandMode::Launcher;
-        settings.launcher_engaged = true;
+        settings.mode = mode;
+        settings.overlay_mode = mode;
+        settings.overlay_engaged = true;
+        settings.overlay_size = settings.target_size();
         let target = settings.target_size();
         settings.target.size = target;
     }
     grow_surface(cx);
 
-    // A dedicated surface with no output lets the compositor place the launcher
+    // A dedicated surface with no output lets the compositor place the overlay
     // on the focused display - the same NULL-output trick fuzzel uses. Re-use
     // it if a previous close is still animating away.
-    let window = launcher_window(cx).or_else(|| open_launcher_window(cx));
+    let window = overlay_window(cx).or_else(|| open_overlay_window(cx));
     if let Some(window) = window {
         window
-            .update(cx, |island, _window, cx| island.prepare_launcher(cx))
+            .update(cx, |island, _window, cx| match mode {
+                IslandMode::Launcher => island.prepare_launcher(cx),
+                IslandMode::Tray => island.prepare_tray(cx),
+                IslandMode::Normal | IslandMode::Calendar => {}
+            })
             .ok();
     }
 }
 
-/// Leaves launcher mode and eases back to the normal size.
+/// Leaves overlay mode and eases back to the normal size.
 ///
-/// Every exit path funnels through here - a successful launch, Escape, or a
-/// failed launch - so the island can't be left expanded or holding the
-/// keyboard. The transient launcher surface is removed by the animator once it
+/// Every exit path funnels through here - a successful launch or stop, Escape,
+/// or a failed action - so the island can't be left expanded or holding the
+/// keyboard. The transient overlay surface is removed by the animator once it
 /// has contracted.
-pub(crate) fn close_launcher(cx: &mut App) {
-    if cx.global::<Settings>().mode != IslandMode::Launcher {
+pub(crate) fn close_overlay(cx: &mut App) {
+    if cx.global::<Settings>().mode == IslandMode::Normal {
         return;
     }
 
@@ -175,18 +187,19 @@ fn start_animation(cx: &mut App) {
 
 /// Settles the surfaces once the shared animation reaches its target.
 ///
-/// The launcher surface is kept large enough to hold the island while it
+/// The overlay surface is kept large enough to hold the island while it
 /// animates; this shrinks it back once the island has come to rest. A closing
-/// launcher's transient surface is then removed entirely so the bar underneath
+/// overlay's transient surface is then removed entirely so the bar underneath
 /// takes over.
 pub(crate) fn finish_animation(cx: &mut App) {
-    let (shrink, remove_launcher) = {
+    let (shrink, remove_overlay) = {
         let settings = cx.global_mut::<Settings>();
         let closing = settings.mode == IslandMode::Normal;
         if closing {
             // The closing animation has settled, so the bars own the
             // appearance again.
-            settings.launcher_engaged = false;
+            settings.overlay_engaged = false;
+            settings.overlay_mode = IslandMode::Normal;
         }
         let shrink = (settings.window_size != settings.target.size).then(|| {
             settings.window_size = settings.target.size;
@@ -195,15 +208,15 @@ pub(crate) fn finish_animation(cx: &mut App) {
         (shrink, closing)
     };
 
-    if remove_launcher {
-        remove_launcher_window(cx);
+    if remove_overlay {
+        remove_overlay_window(cx);
     }
     if let Some(size) = shrink {
         resize_windows(cx, size);
     }
 }
 
-/// All open island windows: the per-display bars and, while open, the launcher.
+/// All open island windows: the per-display bars and, while open, the overlay.
 fn island_windows(cx: &App) -> Vec<WindowHandle<Island>> {
     cx.windows()
         .into_iter()
@@ -211,19 +224,19 @@ fn island_windows(cx: &App) -> Vec<WindowHandle<Island>> {
         .collect()
 }
 
-/// The transient launcher surface, if it exists.
-fn launcher_window(cx: &App) -> Option<WindowHandle<Island>> {
+/// The transient overlay surface, if it exists.
+fn overlay_window(cx: &App) -> Option<WindowHandle<Island>> {
     island_windows(cx).into_iter().find(|window| {
         window
             .read(cx)
-            .map(|island| island.role() == IslandRole::Launcher)
+            .map(|island| island.role() == IslandRole::Overlay)
             .unwrap_or(false)
     })
 }
 
-/// Removes the transient launcher surface once it is no longer needed.
-fn remove_launcher_window(cx: &mut App) {
-    if let Some(window) = launcher_window(cx) {
+/// Removes the transient overlay surface once it is no longer needed.
+fn remove_overlay_window(cx: &mut App) {
+    if let Some(window) = overlay_window(cx) {
         window
             .update(cx, |_island, window, _cx| window.remove_window())
             .ok();
@@ -255,19 +268,19 @@ fn surface_size(current: Size<Pixels>, target: Size<Pixels>) -> Size<Pixels> {
 
 /// Resizes each island surface for its role and requests a redraw.
 fn resize_windows(cx: &mut App, size: Size<Pixels>) {
-    let (mode, normal_size) = {
+    let (normal_size, overlay_engaged) = {
         let settings = cx.global::<Settings>();
-        (settings.mode, settings.normal_size)
+        (settings.normal_size, settings.overlay_engaged)
     };
 
     for handle in island_windows(cx) {
         let role = handle.read(cx).map(|island| island.role()).ok();
         let target = match role {
-            // The launcher surface follows the animated size.
-            Some(IslandRole::Launcher) => size,
-            // Bars stay compact while the launcher owns the shared appearance.
+            // The overlay surface follows the animated size.
+            Some(IslandRole::Overlay) => size,
+            // Bars stay compact while an overlay owns the shared appearance.
             Some(IslandRole::Bar) => {
-                if mode == IslandMode::Launcher {
+                if overlay_engaged {
                     normal_size
                 } else {
                     size
@@ -309,11 +322,11 @@ fn open_bar_window(cx: &mut App, display_id: Option<DisplayId>) -> Option<Window
     .ok()
 }
 
-/// Creates the transient launcher surface on the compositor's focused output.
+/// Creates the transient overlay surface on the compositor's focused output.
 ///
 /// Passing no output to the layer surface lets the compositor choose one; niri
 /// resolves that to its active output, matching fuzzel's behaviour.
-fn open_launcher_window(cx: &mut App) -> Option<WindowHandle<Island>> {
+fn open_overlay_window(cx: &mut App) -> Option<WindowHandle<Island>> {
     let window_size = cx.global::<Settings>().window_size;
 
     cx.open_window(
@@ -334,7 +347,7 @@ fn open_launcher_window(cx: &mut App) -> Option<WindowHandle<Island>> {
             }),
             ..Default::default()
         },
-        |_window, cx| cx.new(|cx| Island::new(IslandRole::Launcher, cx)),
+        |_window, cx| cx.new(|cx| Island::new(IslandRole::Overlay, cx)),
     )
     .ok()
 }

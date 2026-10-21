@@ -33,6 +33,14 @@ pub enum Command {
     ///
     /// Invoking this while the launcher is already open does nothing.
     Launcher,
+
+    /// Expand the island into a StatusNotifierItem system tray.
+    ///
+    /// Enter activates an item, Right opens its DBusMenu (where applications
+    /// usually expose Quit), and Tab switches to a fallback process list for
+    /// applications without a tray item. Invoking this while the tray is
+    /// already open does nothing.
+    Tray,
 }
 
 /// Parses `#rgb`, `#rgba`, `#rrggbb`, or `#rrggbbaa` into a color.

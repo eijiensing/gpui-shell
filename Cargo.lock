@@ -2073,9 +2073,12 @@ dependencies = [
  "chrono",
  "clap",
  "freedesktop-desktop-entry",
+ "futures-lite",
  "gpui",
  "gpui_platform",
+ "libc",
  "pipewire",
+ "zbus",
 ]
 
 [[package]]

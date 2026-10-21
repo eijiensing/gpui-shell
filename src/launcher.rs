@@ -7,8 +7,10 @@
 
 use std::collections::HashSet;
 use std::io;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 
 use freedesktop_desktop_entry::{Iter, get_languages_from_env};
 
@@ -29,7 +31,7 @@ pub struct AppEntry {
 }
 
 impl AppEntry {
-    /// Spawns the application, detached from the shell.
+    /// Spawns the application with a lifetime independent of the shell.
     ///
     /// The entry's `Exec` line is never passed to a shell: it was parsed by the
     /// desktop-entry crate, so quoting and field-code rules are already handled.
@@ -38,21 +40,70 @@ impl AppEntry {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty Exec"));
         };
 
-        let mut child = Command::new(program)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+        let mut child = if systemd_scope_available() {
+            // A shell started by niri lives in a transient systemd scope. A
+            // plain child would inherit that cgroup, so stopping the shell
+            // would stop the application too. Give the app its own scope.
+            let mut command = Command::new("systemd-run");
+            command
+                .args(["--user", "--scope", "--collect", "--", program])
+                .args(args);
+            detach(command)?
+        } else {
+            // Without systemd there is no cgroup to escape, but still leave the
+            // shell's process group so Ctrl+C and terminal closure do not reach
+            // the application.
+            let mut command = Command::new(program);
+            command.args(args);
+            detach(command)?
+        };
 
-        // The shell outlives nothing, so a short-lived reaper thread waits on the
-        // child to keep it from becoming a zombie.
+        // Keep the launcher from accumulating zombies. The child here is the
+        // app itself or the systemd-run wrapper that waits for it.
         std::thread::spawn(move || {
             let _ = child.wait();
         });
 
         Ok(())
     }
+}
+
+/// Whether `systemd-run --user --scope` can actually create a scope here.
+///
+/// Probed once; the answer is cached for the lifetime of the process.
+fn systemd_scope_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+    *AVAILABLE.get_or_init(|| {
+        Command::new("systemd-run")
+            .args(["--user", "--scope", "--collect", "--", "sh", "-c", "exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    })
+}
+
+/// Runs `command` in a new session with no inherited standard streams.
+fn detach(mut command: Command) -> io::Result<Child> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    // SAFETY: `setsid` is async-signal-safe and runs in the forked child before
+    // exec. The child is not a process-group leader, so it succeeds.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    command.spawn()
 }
 
 /// Installed applications, sorted case-insensitively by display name.

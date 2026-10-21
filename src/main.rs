@@ -7,7 +7,9 @@ mod easing;
 mod ipc;
 mod island;
 mod launcher;
+mod process;
 mod server;
+mod status_notifier;
 
 use clap::Parser;
 
