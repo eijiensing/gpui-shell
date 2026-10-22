@@ -38,6 +38,11 @@ pub fn run() {
     // application has a chance to register a tray item.
     crate::status_notifier::start();
 
+    // Become the session's notification server before any application tries
+    // to send a notification. If another server owns the name, the panel
+    // reports that instead of silently dropping notifications.
+    crate::notifications::start();
+
     // Walk the desktop-entry locations once, before any window exists, so the
     // launcher never touches the filesystem from the render path.
     let catalog = Catalog::discover();
@@ -102,6 +107,7 @@ fn apply_command(cx: &mut App, command: Command) {
         Command::TextColor { color } => cx.global_mut::<Settings>().target.text_color = color,
         Command::Launcher => open_overlay(cx, IslandMode::Launcher),
         Command::Tray => open_overlay(cx, IslandMode::Tray),
+        Command::Notifications => open_overlay(cx, IslandMode::Notifications),
     }
 }
 
@@ -135,6 +141,7 @@ fn open_overlay(cx: &mut App, mode: IslandMode) {
             .update(cx, |island, _window, cx| match mode {
                 IslandMode::Launcher => island.prepare_launcher(cx),
                 IslandMode::Tray => island.prepare_tray(cx),
+                IslandMode::Notifications => island.prepare_notifications(cx),
                 IslandMode::Normal | IslandMode::Calendar => {}
             })
             .ok();

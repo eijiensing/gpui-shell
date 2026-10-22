@@ -19,6 +19,11 @@ pub fn tray_size() -> Size<Pixels> {
     Size::new(px(480.0), px(600.0))
 }
 
+/// Expanded size used by the notification center.
+pub fn notifications_size() -> Size<Pixels> {
+    Size::new(px(480.0), px(600.0))
+}
+
 /// What the island is showing.
 ///
 /// The mode selects which content is drawn and which target size the animation
@@ -32,6 +37,8 @@ pub enum IslandMode {
     Launcher,
     /// Expanded StatusNotifierItem tray.
     Tray,
+    /// Expanded notification center.
+    Notifications,
     /// Reserved for a future calendar view; not implemented.
     #[allow(dead_code)]
     Calendar,
@@ -147,6 +154,7 @@ impl Settings {
         match self.mode {
             IslandMode::Launcher => launcher_size(),
             IslandMode::Tray => tray_size(),
+            IslandMode::Notifications => notifications_size(),
             // The calendar is not implemented; it reuses the normal size for now.
             IslandMode::Normal | IslandMode::Calendar => self.normal_size,
         }

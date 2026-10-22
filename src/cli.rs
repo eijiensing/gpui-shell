@@ -41,6 +41,16 @@ pub enum Command {
     /// applications without a tray item. Invoking this while the tray is
     /// already open does nothing.
     Tray,
+
+    /// Expand the island into the notification center.
+    ///
+    /// Lists unread desktop notifications. Enter dismisses the selected one,
+    /// Ctrl+D dismisses all, and Escape closes the panel. Invoking this while
+    /// the center is already open does nothing. The shell receives
+    /// notifications only when it owns the
+    /// `org.freedesktop.Notifications` session-bus name; if another daemon
+    /// owns it, the panel reports that.
+    Notifications,
 }
 
 /// Parses `#rgb`, `#rgba`, `#rrggbb`, or `#rrggbbaa` into a color.

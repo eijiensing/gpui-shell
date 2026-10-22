@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use chrono::Local;
+use chrono::{DateTime, Local};
 use gpui::{
     AnyElement, Context, FocusHandle, Hsla, KeyDownEvent, Rems, Render, ScrollHandle, Window, div,
     prelude::*, px,
@@ -10,6 +10,7 @@ use crate::animation::Animation;
 use crate::appearance::{Appearance, IslandMode, Settings};
 use crate::audio::{self, Volume};
 use crate::launcher::Catalog;
+use crate::notifications::{self, Notification, Urgency};
 use crate::process::Processes;
 use crate::status_notifier::{self, Item, MenuEntry};
 
@@ -322,6 +323,130 @@ impl MenuView {
     }
 }
 
+/// Notification-center interaction state, owned per overlay window.
+struct NotificationPanel {
+    /// Focus target for the filter input and key handling.
+    focus: FocusHandle,
+    /// Notifications currently stored by the D-Bus server, newest first.
+    list: Vec<Notification>,
+    /// What the user has typed to filter the list.
+    query: String,
+    /// Whether Ctrl/Cmd+A has selected the whole query.
+    select_all: bool,
+    /// Indices into `list` matching `query`, in display order.
+    results: Vec<usize>,
+    /// Index into `results` of the highlighted notification.
+    selected: usize,
+    /// Keeps the selected notification in view.
+    scroll: ScrollHandle,
+    /// Error reported by the D-Bus side, if any.
+    error: Option<String>,
+    /// Change feed from the notification server, present on the overlay only.
+    subscription: Option<notifications::Subscription>,
+}
+
+impl NotificationPanel {
+    fn new(focus: FocusHandle, subscribe: bool) -> Self {
+        Self {
+            focus,
+            list: Vec::new(),
+            query: String::new(),
+            select_all: false,
+            results: Vec::new(),
+            selected: 0,
+            scroll: ScrollHandle::new(),
+            error: None,
+            subscription: subscribe.then(notifications::subscribe),
+        }
+    }
+
+    fn selected_notification(&self) -> Option<&Notification> {
+        self.results
+            .get(self.selected)
+            .and_then(|&index| self.list.get(index))
+    }
+
+    fn filter(&self, query: &str) -> Vec<usize> {
+        filter_notifications(&self.list, query)
+    }
+
+    /// Replaces the list while keeping the highlighted notification stable.
+    fn apply(&mut self, snapshot: notifications::Snapshot) {
+        let selected_id = self
+            .selected_notification()
+            .map(|notification| notification.id);
+        let selected_row = self.selected;
+
+        self.list = snapshot.notifications;
+        self.error = snapshot.error;
+        self.results = self.filter(&self.query);
+        self.selected = selected_id
+            .and_then(|id| {
+                self.results.iter().position(|&index| {
+                    self.list
+                        .get(index)
+                        .is_some_and(|notification| notification.id == id)
+                })
+            })
+            .unwrap_or(selected_row);
+        if self.selected >= self.results.len() {
+            self.selected = self.results.len().saturating_sub(1);
+        }
+    }
+
+    fn refilter(&mut self) {
+        self.results = self.filter(&self.query);
+        self.selected = 0;
+        self.scroll = ScrollHandle::new();
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        let len = self.results.len();
+        if len == 0 {
+            return;
+        }
+
+        let current = self.selected.min(len - 1) as isize;
+        let next = (current + delta).clamp(0, len as isize - 1) as usize;
+        self.selected = next;
+        self.scroll.scroll_to_item(next);
+    }
+
+    /// Removes a notification locally so dismissal feels immediate. The D-Bus
+    /// side also broadcasts the change and the next snapshot confirms it.
+    fn remove(&mut self, id: u32) {
+        self.list.retain(|notification| notification.id != id);
+        let selected_row = self.selected;
+        self.results = self.filter(&self.query);
+        self.selected = selected_row.min(self.results.len().saturating_sub(1));
+    }
+
+    fn clear(&mut self) {
+        self.list.clear();
+        self.results.clear();
+        self.selected = 0;
+        self.scroll = ScrollHandle::new();
+    }
+}
+
+/// Indices of notifications matching `query`, case-insensitively.
+fn filter_notifications(list: &[Notification], query: &str) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return (0..list.len()).collect();
+    }
+
+    list.iter()
+        .enumerate()
+        .filter(|(_, notification)| {
+            notification.app_name.to_lowercase().contains(&query)
+                || notification.summary.to_lowercase().contains(&query)
+                || notification.body.to_lowercase().contains(&query)
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
 pub struct Island {
     /// What this surface is for.
     role: IslandRole,
@@ -333,6 +458,7 @@ pub struct Island {
     generation: u64,
     launcher: Launcher,
     tray: Tray,
+    notifications: NotificationPanel,
 }
 
 /// Which kind of surface an [`Island`] drives.
@@ -356,12 +482,14 @@ impl Island {
             generation: 0,
             launcher: Launcher::new(cx.focus_handle()),
             tray: Tray::new(cx.focus_handle()),
+            notifications: NotificationPanel::new(cx.focus_handle(), role == IslandRole::Overlay),
         };
 
         island.start_timer(cx);
         island.watch_volume(cx);
         if role == IslandRole::Overlay {
             island.start_tray_refresh(cx);
+            island.start_notification_updates(cx);
         }
 
         island
@@ -409,6 +537,57 @@ impl Island {
         let snapshot = status_notifier::snapshot();
         self.tray.refresh_items(snapshot);
         cx.notify();
+    }
+
+    /// Resets the notification center for a fresh look at the stored
+    /// notifications. Called on the transient overlay surface.
+    pub fn prepare_notifications(&mut self, cx: &mut Context<Self>) {
+        notifications::start();
+
+        self.notifications.query.clear();
+        self.notifications.select_all = false;
+        self.notifications.selected = 0;
+        self.notifications.scroll = ScrollHandle::new();
+        self.notifications.apply(notifications::snapshot());
+        cx.notify();
+    }
+
+    /// Keeps the notification panel live while the overlay surface exists.
+    ///
+    /// `Update::Arrived` is also the hook for a future on-arrival toast: a
+    /// listener can read the newest snapshot entry and present it without
+    /// opening the panel.
+    fn start_notification_updates(&self, cx: &mut Context<Self>) {
+        let Some(subscription) = &self.notifications.subscription else {
+            return;
+        };
+        let updates = subscription.receiver().clone();
+
+        cx.spawn(async move |island, cx| {
+            while updates.recv().await.is_ok() {
+                let active = island.read_with(cx, |_island, cx| {
+                    cx.global::<Settings>().mode == IslandMode::Notifications
+                });
+                let Ok(active) = active else {
+                    break;
+                };
+                if !active {
+                    continue;
+                }
+
+                let snapshot = notifications::snapshot();
+                if island
+                    .update(cx, |island, cx| {
+                        island.notifications.apply(snapshot);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Asks the server to leave overlay mode.
@@ -478,6 +657,7 @@ impl Island {
         match cx.global::<Settings>().mode {
             IslandMode::Launcher => self.on_launcher_key_down(event, cx),
             IslandMode::Tray => self.on_tray_key_down(event, cx),
+            IslandMode::Notifications => self.on_notifications_key_down(event, cx),
             IslandMode::Normal | IslandMode::Calendar => {}
         }
     }
@@ -530,6 +710,95 @@ impl Island {
             self.launcher.query.push_str(text);
             self.refilter(cx);
         }
+    }
+
+    fn on_notifications_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        let control =
+            keystroke.modifiers.control || keystroke.modifiers.alt || keystroke.modifiers.platform;
+
+        if keystroke.modifiers.secondary() && keystroke.key == "a" {
+            self.notifications.select_all = true;
+            cx.notify();
+            return;
+        }
+
+        // Ctrl/Cmd+D clears the whole center, matching the footer hint.
+        if keystroke.modifiers.secondary() && keystroke.key == "d" {
+            return self.dismiss_all_notifications(cx);
+        }
+
+        match keystroke.key.as_str() {
+            "escape" => return self.request_close(cx),
+            "enter" | "delete" => return self.dismiss_selected_notification(cx),
+            "up" => return self.move_notification_selection(-1, cx),
+            "down" => return self.move_notification_selection(1, cx),
+            "backspace" => {
+                if self.notifications.select_all {
+                    self.notifications.select_all = false;
+                    self.notifications.query.clear();
+                    self.refilter_notifications(cx);
+                } else if self.notifications.query.pop().is_some() {
+                    self.refilter_notifications(cx);
+                }
+                return;
+            }
+            // Leave Tab to GPUI's focus navigation.
+            "tab" => return,
+            _ => {}
+        }
+
+        // Plain typing only; ignore shortcuts and control characters.
+        if control {
+            return;
+        }
+        if let Some(text) = keystroke.key_char.as_deref()
+            && !text.is_empty()
+            && !text.chars().any(char::is_control)
+        {
+            if self.notifications.select_all {
+                self.notifications.select_all = false;
+                self.notifications.query.clear();
+            }
+            self.notifications.query.push_str(text);
+            self.refilter_notifications(cx);
+        }
+    }
+
+    fn refilter_notifications(&mut self, cx: &mut Context<Self>) {
+        self.notifications.refilter();
+        cx.notify();
+    }
+
+    fn move_notification_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        self.notifications.move_selection(delta);
+        cx.notify();
+    }
+
+    /// Dismisses the highlighted notification and removes it immediately.
+    fn dismiss_selected_notification(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self
+            .notifications
+            .selected_notification()
+            .map(|notification| notification.id)
+        else {
+            return;
+        };
+
+        notifications::dismiss(id);
+        self.notifications.remove(id);
+        cx.notify();
+    }
+
+    /// Dismisses every notification in one go.
+    fn dismiss_all_notifications(&mut self, cx: &mut Context<Self>) {
+        if self.notifications.list.is_empty() {
+            return;
+        }
+
+        notifications::dismiss_all();
+        self.notifications.clear();
+        cx.notify();
     }
 
     fn on_tray_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
@@ -1284,6 +1553,154 @@ impl Island {
             .into_any_element()
     }
 
+    /// The notification center: one card per stored notification.
+    fn render_notifications(
+        &self,
+        progress: f32,
+        island: Appearance,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = tray_colors(progress, island);
+
+        let input = self.render_search_field(
+            "notifications-input",
+            &self.notifications.focus,
+            &self.notifications.query,
+            self.notifications.select_all,
+            "Filter notifications…",
+            colors.text,
+            colors.muted,
+            colors.border,
+            colors.selection,
+            cx,
+        );
+
+        let body: AnyElement = if self.notifications.list.is_empty() {
+            if let Some(error) = &self.notifications.error {
+                status_message(format!("Notifications unavailable: {error}"), colors.danger)
+            } else {
+                status_message("No unread notifications".to_string(), colors.muted)
+            }
+        } else if self.notifications.results.is_empty() {
+            status_message("No matching notifications".to_string(), colors.muted)
+        } else {
+            let now = Local::now();
+            let rows = self
+                .notifications
+                .results
+                .iter()
+                .enumerate()
+                .map(|(row, &index)| {
+                    let Some(notification) = self.notifications.list.get(index) else {
+                        return div().into_any_element();
+                    };
+                    let selected = row == self.notifications.selected;
+                    let urgency_color = match notification.urgency {
+                        Urgency::Low => colors.muted,
+                        Urgency::Normal => colors.text,
+                        Urgency::Critical => colors.danger,
+                    };
+
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_start()
+                        .gap_2()
+                        .w_full()
+                        .px(px(10.0))
+                        .py(px(8.0))
+                        .flex_shrink_0()
+                        .rounded_md()
+                        .when(selected, |row| row.bg(colors.selection))
+                        .when(notification.urgency == Urgency::Critical, |row| {
+                            row.border_1().border_color(colors.danger)
+                        })
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .mt(px(4.0))
+                                .w(px(6.0))
+                                .h(px(6.0))
+                                .rounded_full()
+                                .bg(urgency_color),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_2()
+                                        .w_full()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(colors.muted)
+                                                .whitespace_nowrap()
+                                                .text_ellipsis()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .child(notification.app_name.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .text_xs()
+                                                .text_color(colors.muted)
+                                                .child(relative_time(now, notification.received)),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(colors.text)
+                                        .child(notification.summary.clone()),
+                                )
+                                .children((!notification.body.is_empty()).then(|| {
+                                    div()
+                                        .text_xs()
+                                        .text_color(colors.muted)
+                                        .child(notification.body.clone())
+                                })),
+                        )
+                        .into_any_element()
+                });
+
+            div()
+                .id("notifications")
+                .flex()
+                .flex_col()
+                .gap_1()
+                .w_full()
+                .flex_1()
+                .overflow_y_scroll()
+                .track_scroll(&self.notifications.scroll)
+                .children(rows)
+                .into_any_element()
+        };
+
+        let hint = "Type to filter · Enter dismiss · ctrl+d dismiss all · esc close";
+        let footer = tray_footer(None, hint, colors);
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .size_full()
+            .p(px(10.0))
+            .child(input)
+            .child(body)
+            .child(footer)
+            .into_any_element()
+    }
+
     /// The expanded tray view.
     fn render_tray(&self, progress: f32, island: Appearance, cx: &mut Context<Self>) -> AnyElement {
         if let Some(menu) = &self.tray.menu {
@@ -1738,6 +2155,17 @@ fn status_message(message: String, color: Hsla) -> AnyElement {
         .into_any_element()
 }
 
+/// Compact age label shown on a notification card.
+fn relative_time(now: DateTime<Local>, received: DateTime<Local>) -> String {
+    let seconds = now.signed_duration_since(received).num_seconds().max(0);
+    match seconds {
+        0..=59 => "now".to_string(),
+        60..=3599 => format!("{}m", seconds / 60),
+        3600..=86399 => format!("{}h", seconds / 3600),
+        _ => format!("{}d", seconds / 86400),
+    }
+}
+
 /// How far the island has travelled from the normal size towards the expanded
 /// overlay size, in `0..=1`.
 fn overlay_progress(settings: &Settings) -> f32 {
@@ -1793,6 +2221,7 @@ impl Render for Island {
             let focus = match mode {
                 IslandMode::Launcher => Some(self.launcher.focus.clone()),
                 IslandMode::Tray => Some(self.tray.focus.clone()),
+                IslandMode::Notifications => Some(self.notifications.focus.clone()),
                 IslandMode::Normal | IslandMode::Calendar => None,
             };
             if let Some(focus) = focus
@@ -1831,6 +2260,9 @@ impl Render for Island {
                     match content_mode {
                         IslandMode::Launcher => self.render_launcher(progress, island, cx),
                         IslandMode::Tray => self.render_tray(progress, island, cx),
+                        IslandMode::Notifications => {
+                            self.render_notifications(progress, island, cx)
+                        }
                         IslandMode::Normal | IslandMode::Calendar => self.render_normal(),
                     }
                 } else {
@@ -1864,5 +2296,52 @@ impl Render for Island {
                     .justify_center()
                     .child(content),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{Duration, TimeZone};
+
+    use super::*;
+
+    #[test]
+    fn filter_matches_app_summary_and_body() {
+        let list = vec![
+            notification("Mail", "You have mail", ""),
+            notification("Chat", "Hello", "from Alice"),
+            notification("System", "Battery low", ""),
+        ];
+
+        assert_eq!(filter_notifications(&list, ""), vec![0, 1, 2]);
+        assert_eq!(filter_notifications(&list, "MAIL"), vec![0]);
+        assert_eq!(filter_notifications(&list, "alice"), vec![1]);
+        assert_eq!(filter_notifications(&list, "battery"), vec![2]);
+        assert!(filter_notifications(&list, "missing").is_empty());
+    }
+
+    #[test]
+    fn relative_time_uses_compact_units() {
+        let now = Local.with_ymd_and_hms(2026, 10, 22, 12, 0, 0).unwrap();
+
+        assert_eq!(relative_time(now, now), "now");
+        assert_eq!(relative_time(now, now - Duration::seconds(30)), "now");
+        assert_eq!(relative_time(now, now - Duration::seconds(60)), "1m");
+        assert_eq!(relative_time(now, now - Duration::seconds(3600)), "1h");
+        assert_eq!(relative_time(now, now - Duration::seconds(86400)), "1d");
+        // Future timestamps clamp instead of producing negative output.
+        assert_eq!(relative_time(now, now + Duration::seconds(60)), "now");
+    }
+
+    fn notification(app_name: &str, summary: &str, body: &str) -> Notification {
+        Notification {
+            id: 0,
+            app_name: app_name.to_string(),
+            app_icon: None,
+            summary: summary.to_string(),
+            body: body.to_string(),
+            urgency: Urgency::Normal,
+            received: Local::now(),
+        }
     }
 }

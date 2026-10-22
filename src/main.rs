@@ -7,6 +7,7 @@ mod easing;
 mod ipc;
 mod island;
 mod launcher;
+mod notifications;
 mod process;
 mod server;
 mod status_notifier;
