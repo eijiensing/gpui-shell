@@ -1,12 +1,14 @@
 use gpui::{Global, Hsla, Pixels, Size, px};
 
+use crate::glyphs::GlyphSlots;
+
 /// Number of scalar channels the animator drives: the two size components and
 /// the hue/saturation/lightness/alpha of each color.
 pub const CHANNELS: usize = 10;
 
 /// Compact size used by normal mode when `resize` hasn't overridden it.
 pub fn default_normal_size() -> Size<Pixels> {
-    Size::new(px(48.0), px(12.0))
+    Size::new(px(40.0), px(12.0))
 }
 
 /// Expanded size used by the application launcher.
@@ -116,8 +118,11 @@ pub struct Settings {
     /// closing starts, so the overlay content can stay visible while the island
     /// contracts.
     pub overlay_mode: IslandMode,
-    /// Compact size used by normal mode; the `resize` command updates this.
+    /// Compact size used by normal mode, excluding glyph slots; the `resize`
+    /// command updates this.
     pub normal_size: Size<Pixels>,
+    /// Conditions currently signalled in the two glyph slots.
+    pub glyphs: GlyphSlots,
     /// Size the currently open overlay is expanding to.
     ///
     /// Kept while an overlay is open so the content fade can be derived from
@@ -144,9 +149,18 @@ impl Settings {
             mode: IslandMode::Normal,
             overlay_mode: IslandMode::Normal,
             normal_size: appearance.size,
+            glyphs: GlyphSlots::default(),
             overlay_size: appearance.size,
             overlay_engaged: false,
         }
+    }
+
+    /// Compact size plus room for whichever glyph slots are occupied.
+    pub fn normal_size_with_glyphs(&self) -> Size<Pixels> {
+        Size::new(
+            px(f32::from(self.normal_size.width) + self.glyphs.extra_width()),
+            self.normal_size.height,
+        )
     }
 
     /// Size the island settles at for the current mode.
@@ -156,7 +170,42 @@ impl Settings {
             IslandMode::Tray => tray_size(),
             IslandMode::Notifications => notifications_size(),
             // The calendar is not implemented; it reuses the normal size for now.
-            IslandMode::Normal | IslandMode::Calendar => self.normal_size,
+            IslandMode::Normal | IslandMode::Calendar => self.normal_size_with_glyphs(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::glyphs::Glyph;
+
+    #[test]
+    fn each_occupied_side_adds_its_glyphs_slot_width() {
+        let mut settings = Settings::new();
+        let base = settings.normal_size;
+        let battery = Glyph::BatteryLow.style().slot_width;
+        let unread = Glyph::Unread.style().slot_width;
+
+        assert_eq!(settings.target_size(), base);
+
+        settings.glyphs.set(Glyph::BatteryLow);
+        assert_eq!(
+            settings.target_size(),
+            Size::new(px(f32::from(base.width) + battery), base.height)
+        );
+
+        settings.glyphs.set(Glyph::Unread);
+        assert_eq!(
+            settings.target_size(),
+            Size::new(px(f32::from(base.width) + battery + unread), base.height)
+        );
+
+        // A lower-priority glyph on an occupied side does not add width.
+        settings.glyphs.set(Glyph::WifiDown);
+        assert_eq!(
+            settings.target_size(),
+            Size::new(px(f32::from(base.width) + battery + unread), base.height)
+        );
     }
 }

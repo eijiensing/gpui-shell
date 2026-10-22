@@ -11,7 +11,7 @@ use gpui_platform::application;
 
 use crate::animation::Animation;
 use crate::appearance::{IslandMode, Settings};
-use crate::cli::{Cli, Command};
+use crate::cli::{Cli, Command, GlyphAction};
 use crate::ipc;
 use crate::island::{Island, IslandRole};
 use crate::launcher::Catalog;
@@ -27,7 +27,9 @@ pub fn run() {
         let argv = std::iter::once("gpui-shell").chain(line.split_whitespace());
         match Cli::try_parse_from(argv) {
             Ok(cli) => match cli.command {
-                Some(command) => command_tx.try_send(command).map_err(|err| err.to_string()),
+                Some(command) => command
+                    .validate()
+                    .and_then(|()| command_tx.try_send(command).map_err(|err| err.to_string())),
                 None => Err("missing command".to_string()),
             },
             Err(err) => Err(err.to_string()),
@@ -105,6 +107,23 @@ fn apply_command(cx: &mut App, command: Command) {
         }
         Command::Color { color } => cx.global_mut::<Settings>().target.background = color,
         Command::TextColor { color } => cx.global_mut::<Settings>().target.text_color = color,
+        Command::Glyph { action } => {
+            {
+                let settings = cx.global_mut::<Settings>();
+                match action {
+                    GlyphAction::Set { glyph, .. } => settings.glyphs.set(glyph),
+                    GlyphAction::Clear { side, glyph } => match glyph {
+                        Some(glyph) => settings.glyphs.clear(glyph),
+                        None => settings.glyphs.clear_side(side),
+                    },
+                }
+                // Occupied slots widen the compact island; the animator
+                // eases to the new target like any other resize.
+                let target = settings.target_size();
+                settings.target.size = target;
+            }
+            grow_surface(cx);
+        }
         Command::Launcher => open_overlay(cx, IslandMode::Launcher),
         Command::Tray => open_overlay(cx, IslandMode::Tray),
         Command::Notifications => open_overlay(cx, IslandMode::Notifications),
@@ -277,7 +296,7 @@ fn surface_size(current: Size<Pixels>, target: Size<Pixels>) -> Size<Pixels> {
 fn resize_windows(cx: &mut App, size: Size<Pixels>) {
     let (normal_size, overlay_engaged) = {
         let settings = cx.global::<Settings>();
-        (settings.normal_size, settings.overlay_engaged)
+        (settings.normal_size_with_glyphs(), settings.overlay_engaged)
     };
 
     for handle in island_windows(cx) {

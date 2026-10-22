@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 use gpui::Hsla;
 
+use crate::glyphs::{Glyph, Side};
+
 /// A layer-shell island whose appearance can be driven from the command line.
 ///
 /// Running with no command starts the server; running with a command sends it
@@ -51,6 +53,69 @@ pub enum Command {
     /// `org.freedesktop.Notifications` session-bus name; if another daemon
     /// owns it, the panel reports that.
     Notifications,
+
+    /// Manage the glyphs shown in the island's side slots.
+    ///
+    /// The left slot is reserved for machine state (battery, wifi, bluetooth)
+    /// and the right slot for the inbox (unread, do not disturb). Each side
+    /// shows only its highest-priority active glyph; setting another glyph on
+    /// the same side leaves the existing one active underneath it.
+    ///
+    /// Examples:
+    ///   gpui-shell glyph set left battery-low
+    ///   gpui-shell glyph set right unread
+    ///   gpui-shell glyph clear left battery-low
+    ///   gpui-shell glyph clear right
+    Glyph {
+        #[command(subcommand)]
+        action: GlyphAction,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum GlyphAction {
+    /// Activate a glyph in its side's slot.
+    Set {
+        /// Side the glyph belongs to.
+        side: Side,
+        /// Glyph to activate.
+        glyph: Glyph,
+    },
+
+    /// Deactivate a glyph, or every glyph on a side.
+    Clear {
+        /// Side to clear.
+        side: Side,
+        /// Glyph to deactivate; omit to clear the whole side.
+        glyph: Option<Glyph>,
+    },
+}
+
+impl Command {
+    /// Rejects a glyph command that names a glyph from the other side.
+    pub fn validate(&self) -> Result<(), String> {
+        let Command::Glyph { action } = self else {
+            return Ok(());
+        };
+
+        let (side, glyph) = match action {
+            GlyphAction::Set { side, glyph } => (*side, Some(*glyph)),
+            GlyphAction::Clear { side, glyph } => (*side, *glyph),
+        };
+
+        if let Some(glyph) = glyph
+            && glyph.side() != side
+        {
+            return Err(format!(
+                "`{}` belongs in the {} slot, not the {} slot",
+                glyph.name(),
+                glyph.side().name(),
+                side.name()
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 /// Parses `#rgb`, `#rgba`, `#rrggbb`, or `#rrggbbaa` into a color.
