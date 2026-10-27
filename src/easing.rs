@@ -20,6 +20,7 @@ const BOUNCE_SCALE: f32 = 7.5625;
 const BOUNCE_DIVISOR: f32 = 2.75;
 
 /// A standard easing curve.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Easing {
     /// Constant speed.

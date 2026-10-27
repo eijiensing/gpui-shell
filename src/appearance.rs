@@ -1,10 +1,21 @@
 use gpui::{Global, Hsla, Pixels, Size, px};
 
-use crate::glyphs::GlyphSlots;
+use crate::glyphs::{FONT_FAMILY, GlyphSlots, Side};
 
 /// Number of scalar channels the animator drives: the two size components and
 /// the hue/saturation/lightness/alpha of each color.
 pub const CHANNELS: usize = 10;
+
+/// Font family used for the island's clock and notification text.
+///
+/// This is the Nerd Font patched build of Caskaydia Mono. The unpatched family
+/// name is not installed, and fontconfig would silently substitute a
+/// proportional face for it.
+pub const TEXT_FONT_FAMILY: &str = FONT_FAMILY;
+
+/// Normal-mode text size in px. The window's default rem is 16 px, so this is
+/// the same as `Rems(0.5)` but keeps text measurement and rendering in sync.
+pub const NORMAL_TEXT_SIZE: f32 = 8.0;
 
 /// Compact size used by normal mode when `resize` hasn't overridden it.
 pub fn default_normal_size() -> Size<Pixels> {
@@ -24,6 +35,19 @@ pub fn tray_size() -> Size<Pixels> {
 /// Expanded size used by the notification center.
 pub fn notifications_size() -> Size<Pixels> {
     Size::new(px(480.0), px(600.0))
+}
+
+/// A notification summary temporarily shown in place of the clock.
+///
+/// The compact island grows horizontally to fit the summary, so it can be read
+/// without changing the bar's height.
+#[derive(Clone, Debug)]
+pub struct Toast {
+    /// Summary text (already flattened to a single line).
+    pub summary: String,
+    /// Width in px of the summary at the bar's text size, including horizontal
+    /// breathing room but excluding any machine glyph on the left.
+    pub width: Pixels,
 }
 
 /// What the island is showing.
@@ -123,6 +147,8 @@ pub struct Settings {
     pub normal_size: Size<Pixels>,
     /// Conditions currently signalled in the two glyph slots.
     pub glyphs: GlyphSlots,
+    /// Notification summary currently replacing the clock, if any.
+    pub toast: Option<Toast>,
     /// Size the currently open overlay is expanding to.
     ///
     /// Kept while an overlay is open so the content fade can be derived from
@@ -150,17 +176,31 @@ impl Settings {
             overlay_mode: IslandMode::Normal,
             normal_size: appearance.size,
             glyphs: GlyphSlots::default(),
+            toast: None,
             overlay_size: appearance.size,
             overlay_engaged: false,
         }
     }
 
-    /// Compact size plus room for whichever glyph slots are occupied.
+    /// Compact size plus room for the glyph slots that are actually visible
+    /// and for an active notification toast.
+    ///
+    /// Inbox glyphs (unread, do-not-disturb) are hidden while a toast is on
+    /// screen because the summary already conveys the notification. A machine
+    /// glyph on the left keeps its slot, so the summary still fits beside it.
     pub fn normal_size_with_glyphs(&self) -> Size<Pixels> {
-        Size::new(
-            px(f32::from(self.normal_size.width) + self.glyphs.extra_width()),
-            self.normal_size.height,
-        )
+        let base = f32::from(self.normal_size.width);
+        let width = match &self.toast {
+            Some(toast) => {
+                let left = self
+                    .glyphs
+                    .visible(Side::Left)
+                    .map_or(0.0, |glyph| glyph.style().slot_width);
+                base.max(left + f32::from(toast.width))
+            }
+            None => base + self.glyphs.extra_width(),
+        };
+        Size::new(px(width), self.normal_size.height)
     }
 
     /// Size the island settles at for the current mode.
@@ -206,6 +246,38 @@ mod tests {
         assert_eq!(
             settings.target_size(),
             Size::new(px(f32::from(base.width) + battery + unread), base.height)
+        );
+    }
+
+    #[test]
+    fn a_toast_fits_its_summary_and_hides_inbox_glyphs() {
+        let mut settings = Settings::new();
+        settings.glyphs.set(Glyph::Unread);
+        let without_toast = settings.target_size();
+
+        settings.toast = Some(Toast {
+            summary: "Build finished".to_string(),
+            width: px(120.0),
+        });
+        let with_toast = settings.target_size();
+
+        assert_eq!(with_toast.height, without_toast.height);
+        // The unread glyph makes way for the summary, so only the measured
+        // text width (already above the compact clock width) is used.
+        assert_eq!(with_toast.width, px(120.0));
+
+        // A machine glyph keeps its slot beside the toast.
+        settings.glyphs.set(Glyph::BatteryLow);
+        let battery = Glyph::BatteryLow.style().slot_width;
+        assert_eq!(settings.target_size().width, px(120.0 + battery));
+
+        settings.toast = None;
+        assert_eq!(
+            settings.target_size(),
+            Size::new(
+                px(f32::from(without_toast.width) + battery),
+                without_toast.height
+            )
         );
     }
 }

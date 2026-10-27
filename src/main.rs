@@ -1,6 +1,7 @@
 mod animation;
 mod appearance;
 mod audio;
+mod battery;
 mod cli;
 mod client;
 mod easing;

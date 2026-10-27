@@ -1,23 +1,57 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
+use chrono::{DateTime, Local};
 use clap::Parser;
 use gpui::layer_shell::{Anchor, KeyboardInteractivity, LayerShellOptions};
 use gpui::{
-    App, AppContext, DisplayId, Pixels, Size, WindowBounds, WindowHandle, WindowKind,
-    WindowOptions, point, px,
+    App, AppContext, DisplayId, Global, Pixels, Size, WindowBounds, WindowHandle, WindowKind,
+    WindowOptions, font, point, px,
 };
 use gpui_platform::application;
 
 use crate::animation::Animation;
-use crate::appearance::{IslandMode, Settings};
+use crate::appearance::{IslandMode, NORMAL_TEXT_SIZE, Settings, TEXT_FONT_FAMILY, Toast};
+use crate::battery;
 use crate::cli::{Cli, Command, GlyphAction};
+use crate::glyphs::Glyph;
 use crate::ipc;
 use crate::island::{Island, IslandRole};
 use crate::launcher::Catalog;
+use crate::notifications::{self, Notification, Update};
 
 /// How often to look for newly connected displays.
 const DISPLAY_POLL: Duration = Duration::from_millis(500);
+
+/// How long each notification summary stays on the compact island.
+const TOAST_HOLD: Duration = Duration::from_secs(4);
+
+/// Horizontal breathing room around a toast summary, in px.
+const TOAST_PADDING: f32 = 20.0;
+
+/// Cap on the text area so a very long notification cannot take over the bar.
+const TOAST_MAX_WIDTH: f32 = 320.0;
+
+/// Notifications waiting to be shown as toasts, plus the one on screen.
+///
+/// This lives in an app global rather than in an [`Island`] because every bar
+/// shares the clock surface: each display should show the same toast at the
+/// same time, and only one timer should drive the queue.
+#[derive(Default)]
+struct Toasts {
+    queue: VecDeque<Notification>,
+    current: Option<Notification>,
+    /// Last revision of each notification already queued or shown. The store
+    /// keeps notifications until they are dismissed, so this is what stops
+    /// each arrival from re-queueing every older entry in the snapshot.
+    seen: HashMap<u32, DateTime<Local>>,
+    /// Bumped whenever a toast starts, so a superseded hold timer does nothing.
+    generation: u64,
+    /// Notifications have arrived that the user has not opened yet.
+    unread: bool,
+}
+
+impl Global for Toasts {}
 
 pub fn run() {
     let (command_tx, command_rx) = async_channel::unbounded::<Command>();
@@ -52,7 +86,12 @@ pub fn run() {
     application().run(move |cx: &mut App| {
         cx.set_global(Settings::new());
         cx.set_global(Animation::new(cx.global::<Settings>().current));
+        cx.set_global(Toasts::default());
         cx.set_global(catalog);
+
+        // Show arriving notifications as compact toasts and keep the unread
+        // glyph in step with the notification store.
+        start_notification_toasts(cx);
 
         // Consume commands, moving the target appearance or mode.
         cx.spawn(async move |cx| {
@@ -61,6 +100,17 @@ pub fn run() {
                     apply_command(cx, command);
                     start_animation(cx);
                 });
+            }
+        })
+        .detach();
+
+        // Raise the low-battery glyph whenever the battery drops to the
+        // threshold, and clear it again once it recovers. Desktops report
+        // `Battery::Absent`, which simply leaves the glyph clear.
+        let battery_rx = battery::subscribe();
+        cx.spawn(async move |cx| {
+            while let Ok(state) = battery_rx.recv().await {
+                cx.update(|cx| set_glyph(cx, Glyph::BatteryLow, state.is_low()));
             }
         })
         .detach();
@@ -89,6 +139,231 @@ pub fn run() {
         })
         .detach();
     });
+}
+
+/// Shows or hides a glyph, growing the island if the visible slot changed.
+fn set_glyph(cx: &mut App, glyph: Glyph, active: bool) {
+    {
+        let settings = cx.global_mut::<Settings>();
+        if settings.glyphs.is_active(glyph) == active {
+            return;
+        }
+
+        if active {
+            settings.glyphs.set(glyph);
+        } else {
+            settings.glyphs.clear(glyph);
+        }
+
+        let target = settings.target_size();
+        settings.target.size = target;
+    }
+
+    grow_surface(cx);
+    start_animation(cx);
+}
+
+/// Subscribes to notification changes and drives the toast queue.
+fn start_notification_toasts(cx: &mut App) {
+    let subscription = notifications::subscribe();
+    let updates = subscription.receiver().clone();
+
+    cx.spawn(async move |cx| {
+        // Keep the subscription alive for as long as the app runs.
+        let _subscription = subscription;
+
+        while let Ok(update) = updates.recv().await {
+            cx.update(|cx| handle_notification_update(cx, update));
+        }
+    })
+    .detach();
+}
+
+/// Brings the toast queue and the unread glyph up to date after a change in
+/// the notification store.
+fn handle_notification_update(cx: &mut App, update: Update) {
+    let snapshot = notifications::snapshot();
+    let ids: HashSet<u32> = snapshot.notifications.iter().map(|n| n.id).collect();
+    let viewing = cx.global::<Settings>().mode == IslandMode::Notifications;
+
+    let unread = {
+        let toasts = cx.global_mut::<Toasts>();
+
+        // A notification dismissed or expired before its turn should not be
+        // toasted later, and one that is dismissed while on screen should give
+        // way to the next entry immediately.
+        toasts
+            .queue
+            .retain(|notification| ids.contains(&notification.id));
+        toasts.seen.retain(|id, _| ids.contains(id));
+        if toasts
+            .current
+            .as_ref()
+            .is_some_and(|current| !ids.contains(&current.id))
+        {
+            toasts.current = None;
+        }
+
+        match update {
+            Update::Arrived => {
+                // The snapshot is newest-first; queue oldest-first so a burst
+                // is shown in arrival order. A replacement keeps its place and
+                // refreshes the text instead of being queued twice.
+                for notification in snapshot.notifications.iter().rev() {
+                    if let Some(current) = toasts
+                        .current
+                        .as_mut()
+                        .filter(|current| current.id == notification.id)
+                    {
+                        *current = notification.clone();
+                    } else if let Some(queued) = toasts
+                        .queue
+                        .iter_mut()
+                        .find(|queued| queued.id == notification.id)
+                    {
+                        *queued = notification.clone();
+                    } else if toasts.seen.get(&notification.id) != Some(&notification.received) {
+                        toasts.queue.push_back(notification.clone());
+                    }
+
+                    toasts.seen.insert(notification.id, notification.received);
+                }
+
+                // Nothing is unread while the user is already looking at the
+                // notification center.
+                if !viewing {
+                    toasts.unread = true;
+                }
+            }
+            Update::Closed => {
+                if snapshot.notifications.is_empty() {
+                    toasts.unread = false;
+                }
+            }
+        }
+
+        toasts.unread
+    };
+
+    set_glyph(cx, Glyph::Unread, unread);
+
+    let (showing, queued) = {
+        let toasts = cx.global::<Toasts>();
+        (toasts.current.is_some(), !toasts.queue.is_empty())
+    };
+    if !showing {
+        if queued {
+            show_next_toast(cx);
+        } else {
+            hide_toast(cx);
+        }
+    }
+}
+
+/// Moves the queue forward: show the next summary, or return to the clock.
+fn show_next_toast(cx: &mut App) {
+    let (notification, generation) = {
+        let toasts = cx.global_mut::<Toasts>();
+        toasts.current = toasts.queue.pop_front();
+        toasts.generation = toasts.generation.wrapping_add(1);
+        (toasts.current.clone(), toasts.generation)
+    };
+
+    let Some(notification) = notification else {
+        hide_toast(cx);
+        return;
+    };
+
+    let summary = toast_summary(&notification);
+    let width = px(toast_width(cx, &summary));
+    {
+        let settings = cx.global_mut::<Settings>();
+        settings.toast = Some(Toast { summary, width });
+        let target = settings.target_size();
+        settings.target.size = target;
+    }
+
+    grow_surface(cx);
+    start_animation(cx);
+    schedule_toast_advance(cx, generation);
+}
+
+/// Removes the toast and lets the island contract back to the clock width.
+fn hide_toast(cx: &mut App) {
+    let had_toast = {
+        let settings = cx.global_mut::<Settings>();
+        let had_toast = settings.toast.take().is_some();
+        let target = settings.target_size();
+        settings.target.size = target;
+        had_toast
+    };
+
+    if had_toast {
+        start_animation(cx);
+    }
+}
+
+/// Retires the current toast after [`TOAST_HOLD`]. The generation check makes
+/// sure a timer from a superseded toast cannot advance the queue twice.
+fn schedule_toast_advance(cx: &mut App, generation: u64) {
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(TOAST_HOLD).await;
+
+        cx.update(|cx| {
+            if cx.global::<Toasts>().generation != generation {
+                return;
+            }
+
+            cx.global_mut::<Toasts>().current = None;
+            if cx.global::<Toasts>().queue.is_empty() {
+                hide_toast(cx);
+            } else {
+                show_next_toast(cx);
+            }
+        });
+    })
+    .detach();
+}
+
+/// Marks stored notifications as seen when the notification center opens.
+fn mark_notifications_read(cx: &mut App) {
+    cx.global_mut::<Toasts>().unread = false;
+    set_glyph(cx, Glyph::Unread, false);
+}
+
+/// The single line shown in a toast: the summary, falling back to the body's
+/// first words and then the application name.
+fn toast_summary(notification: &Notification) -> String {
+    let text = if notification.summary.trim().is_empty() {
+        &notification.body
+    } else {
+        &notification.summary
+    };
+    let summary = text.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    if summary.is_empty() {
+        notification.app_name.clone()
+    } else {
+        summary
+    }
+}
+
+/// Width the summary actually occupies at the bar's font and text size, plus
+/// horizontal breathing room. Measuring instead of estimating keeps the grown
+/// island close to the text rather than leaving large empty margins.
+fn toast_width(cx: &App, summary: &str) -> f32 {
+    let text_system = cx.text_system();
+    let font_id = text_system.resolve_font(&font(TEXT_FONT_FAMILY));
+    let font_size = px(NORMAL_TEXT_SIZE);
+
+    // The bar face is monospace and the summary is a single line, so summing
+    // character advances matches what the renderer lays out.
+    let text_width: f32 = summary
+        .chars()
+        .map(|ch| f32::from(text_system.layout_width(font_id, font_size, ch)))
+        .sum();
+
+    (text_width + TOAST_PADDING).min(TOAST_MAX_WIDTH)
 }
 
 /// Updates the target state in response to a command.
@@ -138,6 +413,10 @@ fn apply_command(cx: &mut App, command: Command) {
 fn open_overlay(cx: &mut App, mode: IslandMode) {
     if cx.global::<Settings>().mode == mode {
         return;
+    }
+
+    if mode == IslandMode::Notifications {
+        mark_notifications_read(cx);
     }
 
     {
@@ -376,4 +655,38 @@ fn open_overlay_window(cx: &mut App) -> Option<WindowHandle<Island>> {
         |_window, cx| cx.new(|cx| Island::new(IslandRole::Overlay, cx)),
     )
     .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Local;
+
+    use super::*;
+    use crate::notifications::Urgency;
+
+    #[test]
+    fn toast_summary_is_a_single_line_with_fallbacks() {
+        let mut notification = notification("  Build\n finished  ", "ignored");
+        assert_eq!(toast_summary(&notification), "Build finished");
+
+        notification.summary.clear();
+        notification.body = "Line one\nline two".to_string();
+        assert_eq!(toast_summary(&notification), "Line one line two");
+
+        notification.body.clear();
+        notification.app_name = "Mail".to_string();
+        assert_eq!(toast_summary(&notification), "Mail");
+    }
+
+    fn notification(summary: &str, body: &str) -> Notification {
+        Notification {
+            id: 1,
+            app_name: String::new(),
+            app_icon: None,
+            summary: summary.to_string(),
+            body: body.to_string(),
+            urgency: Urgency::Normal,
+            received: Local::now(),
+        }
+    }
 }

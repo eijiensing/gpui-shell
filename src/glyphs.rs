@@ -7,11 +7,13 @@
 
 use clap::ValueEnum;
 
-/// Font carrying the Nerd Font private-use glyphs.
+/// Font carrying the island's text and the Nerd Font private-use glyphs.
 ///
-/// The body font is CaskaydiaMono; the Nerd Font patched build of the same
-/// typeface supplies the icons. "Mono" keeps every icon on a single advance
-/// width so it fits the fixed slot without clipping.
+/// Only the Nerd Font patched build of Caskaydia Mono is installed; asking for
+/// the plain `CaskaydiaMono` family silently falls back to a proportional face
+/// (DejaVu Sans), which breaks the bar's even character spacing. The "Mono"
+/// variant keeps text and icons on a single advance width, so it is also the
+/// right choice for the clock and notification summaries.
 pub const FONT_FAMILY: &str = "CaskaydiaMono Nerd Font Mono";
 
 /// Which side of the text a glyph can occupy.
@@ -249,11 +251,13 @@ impl GlyphSlots {
     }
 
     /// Whether `side`'s slot is occupied, and therefore claims width.
+    #[allow(dead_code)]
     pub fn occupied(self, side: Side) -> bool {
         self.visible(side).is_some()
     }
 
     /// Number of occupied slots (0, 1, or 2).
+    #[allow(dead_code)]
     pub fn occupied_count(self) -> usize {
         [Side::Left, Side::Right]
             .into_iter()

@@ -2,12 +2,12 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
 use gpui::{
-    AnyElement, Context, FocusHandle, Hsla, KeyDownEvent, Rems, Render, ScrollHandle,
-    Transformation, Window, div, prelude::*, px, radians, svg,
+    AnyElement, Context, FocusHandle, Hsla, KeyDownEvent, Render, ScrollHandle, Transformation,
+    Window, div, prelude::*, px, radians, svg,
 };
 
 use crate::animation::Animation;
-use crate::appearance::{Appearance, IslandMode, Settings};
+use crate::appearance::{Appearance, IslandMode, NORMAL_TEXT_SIZE, Settings, TEXT_FONT_FAMILY};
 use crate::audio::{self, Volume};
 use crate::glyphs::{self, Glyph, GlyphStyle, Side};
 use crate::launcher::Catalog;
@@ -555,9 +555,8 @@ impl Island {
 
     /// Keeps the notification panel live while the overlay surface exists.
     ///
-    /// `Update::Arrived` is also the hook for a future on-arrival toast: a
-    /// listener can read the newest snapshot entry and present it without
-    /// opening the panel.
+    /// Compact-island toasts are driven globally in `server`, so this listener
+    /// only refreshes the open panel.
     fn start_notification_updates(&self, cx: &mut Context<Self>) {
         let Some(subscription) = &self.notifications.subscription else {
             return;
@@ -1388,20 +1387,39 @@ impl Island {
     /// while a single occupied slot moves it half a slot towards the other
     /// side (the extra width all ends up on one side).
     fn render_normal(&self, cx: &Context<Self>) -> AnyElement {
+        let (glyphs, text_color, toast) = {
+            let settings = cx.global::<Settings>();
+            (
+                settings.glyphs,
+                settings.current.text_color,
+                settings.toast.as_ref().map(|toast| toast.summary.clone()),
+            )
+        };
+        // Audio is transient feedback the user is actively producing, so it
+        // wins over a toast just like it wins over the clock.
+        let showing_toast = toast.is_some();
         let text = match &self.indicator {
-            NormalIndicator::Clock => self.time.clone(),
+            NormalIndicator::Clock => toast.unwrap_or_else(|| self.time.clone()),
             NormalIndicator::Volume(Volume::Muted) => "muted".to_string(),
             NormalIndicator::Volume(Volume::Percent(percent)) => format!("{percent}%"),
         };
-        let (glyphs, text_color) = {
-            let settings = cx.global::<Settings>();
-            (settings.glyphs, settings.current.text_color)
-        };
 
         let left = glyphs.visible(Side::Left);
-        let right = glyphs.visible(Side::Right);
+        // The inbox glyphs describe notifications that the toast is already
+        // showing, so they would only compete with the summary for width.
+        let right = if showing_toast {
+            None
+        } else {
+            glyphs.visible(Side::Right)
+        };
 
-        let mut center = div().flex_1().flex().items_center().justify_center();
+        let mut center = div()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .flex()
+            .items_center()
+            .justify_center();
         // Unequal slot widths move the flexible center off the island's
         // midpoint. When both sides are occupied the clock should stay
         // centered, so pad the wider side's edge to cancel half the
@@ -1416,7 +1434,14 @@ impl Island {
                 center = center.pl(px(right_width - left_width));
             }
         }
-        center = center.child(text);
+        center = center.child(
+            div()
+                .min_w_0()
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(text),
+        );
 
         let mut row = div().flex().flex_row().items_center().w_full().h_full();
 
@@ -2411,9 +2436,9 @@ impl Render for Island {
                     .h(box_size.height)
                     .bg(island.background)
                     .text_color(island.text_color)
-                    .text_size(Rems(0.5))
+                    .text_size(px(NORMAL_TEXT_SIZE))
                     .rounded_b_lg()
-                    .font_family("CaskaydiaMono")
+                    .font_family(TEXT_FONT_FAMILY)
                     .overflow_hidden()
                     .flex()
                     .items_center()

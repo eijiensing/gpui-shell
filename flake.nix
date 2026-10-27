@@ -32,6 +32,26 @@
 
       runtimeLibraryPath = pkgs.lib.makeLibraryPath runtimeLibs + ":/run/opengl-driver/lib";
 
+      # The island renders both text and Nerd Font icons with the patched
+      # Caskaydia Mono family. Vendoring it keeps the package and devshell
+      # working even if it is removed from the host font configuration.
+      caskaydiaMono = pkgs.nerd-fonts.caskaydia-mono;
+
+      # Merge the host font configuration with the vendored font. Including
+      # /etc/fonts/fonts.conf keeps system fallbacks (symbols, emoji, CJK)
+      # available; `ignore_missing` means a host without that file still falls
+      # back to just the bundled font. Merely adding the package to
+      # buildInputs would not work: fontconfig only scans the directories in
+      # its configuration.
+      fontConfig = pkgs.writeText "gpui-shell-fonts.conf" ''
+        <?xml version="1.0"?>
+        <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+        <fontconfig>
+          <include ignore_missing="yes">/etc/fonts/fonts.conf</include>
+          <dir>${caskaydiaMono}/share/fonts</dir>
+        </fontconfig>
+      '';
+
     in
     {
       packages.${system}.default = pkgs.rustPlatform.buildRustPackage {
@@ -71,7 +91,8 @@
 
         postInstall = ''
           wrapProgram $out/bin/gpui-shell \
-            --set LD_LIBRARY_PATH "${runtimeLibraryPath}"
+            --set LD_LIBRARY_PATH "${runtimeLibraryPath}" \
+            --set FONTCONFIG_FILE "${fontConfig}"
         '';
       };
 
@@ -93,8 +114,9 @@
           ++ runtimeLibs;
 
         shellHook = ''
-					export LD_LIBRARY_PATH="${runtimeLibraryPath}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-					export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
+          export LD_LIBRARY_PATH="${runtimeLibraryPath}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
+          export FONTCONFIG_FILE="${fontConfig}"
         '';
       };
     };
