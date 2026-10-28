@@ -448,6 +448,90 @@ fn filter_notifications(list: &[Notification], query: &str) -> Vec<usize> {
         .collect()
 }
 
+/// A panel reachable from the overview hub.
+///
+/// The declaration order is the order the squares are shown in, so the hub
+/// reads left to right like a small app dock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OverviewCommand {
+    Launcher,
+    Tray,
+    Notifications,
+}
+
+impl OverviewCommand {
+    const ALL: [OverviewCommand; 3] = [
+        OverviewCommand::Launcher,
+        OverviewCommand::Tray,
+        OverviewCommand::Notifications,
+    ];
+
+    /// Caption shown under the square.
+    fn label(self) -> &'static str {
+        match self {
+            OverviewCommand::Launcher => "Launcher",
+            OverviewCommand::Tray => "Tray",
+            OverviewCommand::Notifications => "Notifications",
+        }
+    }
+
+    /// Nerd Font codepoint drawn inside the square.
+    fn icon(self) -> &'static str {
+        match self {
+            OverviewCommand::Launcher => "\u{f009}",
+            OverviewCommand::Tray => "\u{f0ca}",
+            OverviewCommand::Notifications => "\u{f0f3}",
+        }
+    }
+
+    /// Shortcut letter that opens this command directly.
+    fn initial(self) -> char {
+        match self {
+            OverviewCommand::Launcher => 'l',
+            OverviewCommand::Tray => 't',
+            OverviewCommand::Notifications => 'n',
+        }
+    }
+
+    /// Mode this command opens.
+    fn mode(self) -> IslandMode {
+        match self {
+            OverviewCommand::Launcher => IslandMode::Launcher,
+            OverviewCommand::Tray => IslandMode::Tray,
+            OverviewCommand::Notifications => IslandMode::Notifications,
+        }
+    }
+
+    fn from_initial(ch: char) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|command| command.initial().eq_ignore_ascii_case(&ch))
+    }
+}
+
+/// Overview-hub interaction state, owned per overlay window.
+struct Overview {
+    /// Focus target for key handling; the hub has no text field.
+    focus: FocusHandle,
+    /// Index into [`OverviewCommand::ALL`] of the highlighted square.
+    selected: usize,
+}
+
+impl Overview {
+    fn new(focus: FocusHandle) -> Self {
+        Self { focus, selected: 0 }
+    }
+
+    fn selected_command(&self) -> OverviewCommand {
+        OverviewCommand::ALL[self.selected.min(OverviewCommand::ALL.len() - 1)]
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        let last = OverviewCommand::ALL.len() as isize - 1;
+        self.selected = (self.selected as isize + delta).clamp(0, last) as usize;
+    }
+}
+
 pub struct Island {
     /// What this surface is for.
     role: IslandRole,
@@ -460,13 +544,14 @@ pub struct Island {
     launcher: Launcher,
     tray: Tray,
     notifications: NotificationPanel,
+    overview: Overview,
 }
 
 /// Which kind of surface an [`Island`] drives.
 ///
 /// [`IslandRole::Bar`] surfaces exist for every display and only ever show the
 /// compact clock. [`IslandRole::Overlay`] is a transient surface created on the
-/// compositor's focused output while the launcher or tray is open, so it can
+/// compositor's focused output while an overlay panel is open, so it can
 /// expand and take keyboard focus without disturbing the bars.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum IslandRole {
@@ -484,6 +569,7 @@ impl Island {
             launcher: Launcher::new(cx.focus_handle()),
             tray: Tray::new(cx.focus_handle()),
             notifications: NotificationPanel::new(cx.focus_handle(), role == IslandRole::Overlay),
+            overview: Overview::new(cx.focus_handle()),
         };
 
         island.start_timer(cx);
@@ -498,6 +584,13 @@ impl Island {
 
     pub fn role(&self) -> IslandRole {
         self.role
+    }
+
+    /// Resets the overview hub to its first square. Called on the transient
+    /// overlay surface when the overview is requested.
+    pub fn prepare_overview(&mut self, cx: &mut Context<Self>) {
+        self.overview.selected = 0;
+        cx.notify();
     }
 
     /// Resets the launcher for a fresh search. Called on the transient launcher
@@ -655,11 +748,56 @@ impl Island {
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         // Keys arriving after an overlay has been closed are ignored.
         match cx.global::<Settings>().mode {
+            IslandMode::Overview => self.on_overview_key_down(event, cx),
             IslandMode::Launcher => self.on_launcher_key_down(event, cx),
             IslandMode::Tray => self.on_tray_key_down(event, cx),
             IslandMode::Notifications => self.on_notifications_key_down(event, cx),
             IslandMode::Normal | IslandMode::Calendar => {}
         }
+    }
+
+    fn on_overview_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        let control =
+            keystroke.modifiers.control || keystroke.modifiers.alt || keystroke.modifiers.platform;
+
+        match keystroke.key.as_str() {
+            "escape" => return self.request_close(cx),
+            "enter" => {
+                let command = self.overview.selected_command();
+                return self.open_overview_command(command, cx);
+            }
+            "left" | "up" => {
+                self.overview.move_selection(-1);
+                cx.notify();
+                return;
+            }
+            "right" | "down" => {
+                self.overview.move_selection(1);
+                cx.notify();
+                return;
+            }
+            // Leave Tab to GPUI's focus navigation.
+            "tab" => return,
+            _ => {}
+        }
+
+        // Plain typing only; ignore shortcuts and control characters.
+        if control {
+            return;
+        }
+        if let Some(text) = keystroke.key_char.as_deref()
+            && let Some(command) = text.chars().find_map(OverviewCommand::from_initial)
+        {
+            self.open_overview_command(command, cx);
+        }
+    }
+
+    /// Opens a command from the hub, reusing the overlay surface for that panel.
+    /// Deferred because switching modes re-prepares the overlay content and
+    /// must not run while this window is borrowed.
+    fn open_overview_command(&mut self, command: OverviewCommand, cx: &mut Context<Self>) {
+        cx.defer(move |cx| crate::server::open_panel(cx, command.mode()));
     }
 
     fn on_launcher_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
@@ -1525,6 +1663,104 @@ impl Island {
             .into_any_element()
     }
 
+    /// The overview hub: every panel as an app-like square in a row.
+    fn render_overview(
+        &self,
+        progress: f32,
+        island: Appearance,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = tray_colors(progress, island);
+
+        let squares = OverviewCommand::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, command)| {
+                let selected = index == self.overview.selected;
+                let label_color = if selected { colors.text } else { colors.muted };
+                let square_bg = if selected {
+                    colors.selection
+                } else {
+                    colors.border
+                };
+
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_2()
+                    .w(px(128.0))
+                    .py(px(8.0))
+                    .rounded_md()
+                    .when(selected, |tile| tile.bg(colors.selection))
+                    .child(
+                        // The square itself; its icon is the visual anchor.
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(72.0))
+                            .h(px(72.0))
+                            .rounded_xl()
+                            .bg(square_bg)
+                            .border_1()
+                            .border_color(if selected { colors.text } else { colors.border })
+                            .child(
+                                div()
+                                    .font_family(glyphs::FONT_FAMILY)
+                                    .text_size(px(30.0))
+                                    .line_height(px(30.0))
+                                    .text_color(colors.text)
+                                    .child(command.icon()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(label_color)
+                            .whitespace_nowrap()
+                            .child(command.label()),
+                    )
+                    .child(
+                        // Shortcut hint, so the first-letter behaviour is
+                        // discoverable without reading the footer.
+                        div()
+                            .px(px(6.0))
+                            .rounded_xs()
+                            .bg(colors.border)
+                            .text_xs()
+                            .text_color(label_color)
+                            .child(command.initial().to_ascii_uppercase().to_string()),
+                    )
+                    .into_any_element()
+            });
+
+        let hint = "←/→ select · Enter open · or press L / T / N · esc close";
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .size_full()
+            .p(px(10.0))
+            .track_focus(&self.overview.focus)
+            .on_key_down(cx.listener(Self::on_key_down))
+            .child(div().text_xs().text_color(colors.muted).child("Overview"))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_center()
+                    .gap_3()
+                    .w_full()
+                    .flex_1()
+                    .children(squares),
+            )
+            .child(tray_footer(None, hint, colors))
+            .into_any_element()
+    }
+
     /// The expanded search view.
     fn render_launcher(
         &self,
@@ -2368,6 +2604,7 @@ impl Render for Island {
         // mode with a search field is open.
         if self.role == IslandRole::Overlay {
             let focus = match mode {
+                IslandMode::Overview => Some(self.overview.focus.clone()),
                 IslandMode::Launcher => Some(self.launcher.focus.clone()),
                 IslandMode::Tray => Some(self.tray.focus.clone()),
                 IslandMode::Notifications => Some(self.notifications.focus.clone()),
@@ -2407,6 +2644,7 @@ impl Render for Island {
                 };
                 let content = if overlay_active {
                     match content_mode {
+                        IslandMode::Overview => self.render_overview(progress, island, cx),
                         IslandMode::Launcher => self.render_launcher(progress, island, cx),
                         IslandMode::Tray => self.render_tray(progress, island, cx),
                         IslandMode::Notifications => {
@@ -2477,6 +2715,27 @@ mod tests {
         assert_eq!(bluetooth.rotation, 90.0);
         assert!(bluetooth.slot_width > battery.slot_width);
         assert!(Glyph::Unread.style().slot_width < battery.slot_width);
+    }
+
+    #[test]
+    fn overview_commands_are_reachable_by_their_initial() {
+        assert_eq!(
+            OverviewCommand::from_initial('l'),
+            Some(OverviewCommand::Launcher)
+        );
+        assert_eq!(
+            OverviewCommand::from_initial('L'),
+            Some(OverviewCommand::Launcher)
+        );
+        assert_eq!(
+            OverviewCommand::from_initial('t'),
+            Some(OverviewCommand::Tray)
+        );
+        assert_eq!(
+            OverviewCommand::from_initial('n'),
+            Some(OverviewCommand::Notifications)
+        );
+        assert_eq!(OverviewCommand::from_initial('x'), None);
     }
 
     #[test]

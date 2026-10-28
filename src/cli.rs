@@ -31,6 +31,14 @@ pub enum Command {
         color: Hsla,
     },
 
+    /// Expand the island into the overview hub.
+    ///
+    /// Shows the other panels as app-like squares in a row. Use Left/Right to
+    /// select a square and Enter to open it, or press `l`, `t`, or `n` to open
+    /// the launcher, tray, or notifications directly. Escape closes the hub.
+    /// Invoking this while the overview is already open does nothing.
+    Overview,
+
     /// Expand the island into an application launcher.
     ///
     /// Invoking this while the launcher is already open does nothing.

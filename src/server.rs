@@ -399,6 +399,7 @@ fn apply_command(cx: &mut App, command: Command) {
             }
             grow_surface(cx);
         }
+        Command::Overview => open_overlay(cx, IslandMode::Overview),
         Command::Launcher => open_overlay(cx, IslandMode::Launcher),
         Command::Tray => open_overlay(cx, IslandMode::Tray),
         Command::Notifications => open_overlay(cx, IslandMode::Notifications),
@@ -437,6 +438,7 @@ fn open_overlay(cx: &mut App, mode: IslandMode) {
     if let Some(window) = window {
         window
             .update(cx, |island, _window, cx| match mode {
+                IslandMode::Overview => island.prepare_overview(cx),
                 IslandMode::Launcher => island.prepare_launcher(cx),
                 IslandMode::Tray => island.prepare_tray(cx),
                 IslandMode::Notifications => island.prepare_notifications(cx),
@@ -444,6 +446,16 @@ fn open_overlay(cx: &mut App, mode: IslandMode) {
             })
             .ok();
     }
+}
+
+/// Opens an overlay panel from inside the app and animates the resize.
+///
+/// [`open_overlay`] only moves the target appearance; the command loop that
+/// normally consumes commands starts the animation afterwards. The overview
+/// hub bypasses that loop, so it needs both steps here.
+pub(crate) fn open_panel(cx: &mut App, mode: IslandMode) {
+    open_overlay(cx, mode);
+    start_animation(cx);
 }
 
 /// Leaves overlay mode and eases back to the normal size.

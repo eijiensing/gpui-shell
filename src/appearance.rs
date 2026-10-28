@@ -22,6 +22,11 @@ pub fn default_normal_size() -> Size<Pixels> {
     Size::new(px(40.0), px(12.0))
 }
 
+/// Expanded size used by the overview hub.
+pub fn overview_size() -> Size<Pixels> {
+    Size::new(px(480.0), px(240.0))
+}
+
 /// Expanded size used by the application launcher.
 pub fn launcher_size() -> Size<Pixels> {
     Size::new(px(420.0), px(600.0))
@@ -59,6 +64,8 @@ pub struct Toast {
 pub enum IslandMode {
     /// Compact clock or volume indicator.
     Normal,
+    /// Expanded hub linking to the other panels.
+    Overview,
     /// Expanded application search.
     Launcher,
     /// Expanded StatusNotifierItem tray.
@@ -157,9 +164,9 @@ pub struct Settings {
     pub overlay_size: Size<Pixels>,
     /// Whether an overlay currently owns the shared appearance.
     ///
-    /// Set when the launcher or tray opens and cleared once its closing
-    /// animation has settled. Bar surfaces stay compact while this is set, so
-    /// the overlay's resize never reaches displays that are not hosting it.
+    /// Set when an overlay panel opens and cleared once its closing animation
+    /// has settled. Bar surfaces stay compact while this is set, so the
+    /// overlay's resize never reaches displays that are not hosting it.
     pub overlay_engaged: bool,
 }
 
@@ -206,6 +213,7 @@ impl Settings {
     /// Size the island settles at for the current mode.
     pub fn target_size(&self) -> Size<Pixels> {
         match self.mode {
+            IslandMode::Overview => overview_size(),
             IslandMode::Launcher => launcher_size(),
             IslandMode::Tray => tray_size(),
             IslandMode::Notifications => notifications_size(),
