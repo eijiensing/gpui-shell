@@ -24,7 +24,7 @@ pub fn default_normal_size() -> Size<Pixels> {
 
 /// Expanded size used by the overview hub.
 pub fn overview_size() -> Size<Pixels> {
-    Size::new(px(480.0), px(240.0))
+    Size::new(px(440.0), px(220.0))
 }
 
 /// Expanded size used by the application launcher.
