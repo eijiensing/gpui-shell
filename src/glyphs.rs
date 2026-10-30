@@ -1,9 +1,11 @@
-//! The two glyph slots that flank the island's normal-mode text.
+//! Glyph vocabulary for the compact status dot and the overview screen.
 //!
-//! Each side owns exactly one visible slot, but several conditions can be
-//! active at once. The active glyph with the lowest [`Glyph::priority`] wins,
-//! so independent producers can set and clear their own state without having
-//! to coordinate with each other.
+//! The compact island shows a single [`Severity`] dot to the right of the
+//! clock. Detailed conditions ([`Glyph`]) are listed on the overview screen,
+//! where there is enough room to render legible icons and labels.
+//!
+//! Several detailed glyphs can be active at once; [`GlyphSlots::active`]
+//! exposes all of them for the overview.
 
 use clap::ValueEnum;
 
@@ -13,13 +15,57 @@ use clap::ValueEnum;
 /// the plain `CaskaydiaMono` family silently falls back to a proportional face
 /// (DejaVu Sans), which breaks the bar's even character spacing. The "Mono"
 /// variant keeps text and icons on a single advance width, so it is also the
-/// right choice for the clock and notification summaries.
+/// right choice for the clock, notification summaries, and icons.
 pub const FONT_FAMILY: &str = "CaskaydiaMono Nerd Font Mono";
 
-/// Which side of the text a glyph can occupy.
+/// Coarse machine health, drawn as one dot to the right of the clock.
 ///
-/// Left is fixed to machine state (hardware and connectivity); right is fixed
-/// to the inbox (unread notifications and do-not-disturb).
+/// The stages are ordered from calm to urgent so the highest one can be picked
+/// with a simple maximum.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+pub enum Severity {
+    /// No dot is drawn.
+    #[default]
+    None,
+    /// Something worth knowing, but not a problem yet.
+    Info,
+    /// Something needs attention.
+    Warn,
+    /// Something is broken or dangerous.
+    Critical,
+}
+
+impl Severity {
+    /// Horizontal room the dot claims on the right of the clock, including its
+    /// gap. The clock is centered in the remaining width, so the island only
+    /// grows when this is non-zero.
+    pub const SLOT_WIDTH: f32 = 12.0;
+
+    /// Nerd Font private-use codepoint for the dot, or `None` when hidden.
+    pub fn icon(self) -> Option<&'static str> {
+        match self {
+            Severity::None => None,
+            Severity::Info => Some("\u{eb8a}"), // nf-cod-circle_small_filled
+            Severity::Warn => Some("\u{eabc}"), // nf-cod-circle
+            Severity::Critical => Some("\u{ea71}"), // nf-cod-circle_filled
+        }
+    }
+
+    /// Width this stage adds to the compact island.
+    pub fn slot_width(self) -> f32 {
+        if self.icon().is_some() {
+            Self::SLOT_WIDTH
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Which side of the inbox a detailed glyph belongs to.
+///
+/// This no longer affects where icons are drawn (the bar shows only the status
+/// dot), but it keeps the `glyph` command's vocabulary stable and groups the
+/// conditions on the overview.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Side {
     Left,
@@ -35,62 +81,30 @@ impl Side {
     }
 }
 
-/// A condition the normal-mode island can signal.
+/// A detailed condition listed on the overview screen.
 ///
 /// The names are also the CLI values (`battery-low`, `wifi-down`, ...).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Glyph {
-    /// Battery is low. Left slot; outranks wifi and bluetooth.
+    /// Battery is low. Left side.
     #[value(name = "battery-low")]
     BatteryLow,
-    /// Wifi is unavailable. Left slot; shown when battery is fine.
+    /// Wifi is unavailable. Left side.
     #[value(name = "wifi-down")]
     WifiDown,
-    /// Bluetooth is off or unavailable. Left slot; lowest machine priority.
+    /// Bluetooth is off or unavailable. Left side.
     #[value(name = "bluetooth-off")]
     BluetoothOff,
-    /// There are unread notifications. Right slot; shown when DND is off.
+    /// There are unread notifications. Right side.
     #[value(name = "unread")]
     Unread,
-    /// Do not disturb is enabled. Right slot; outranks unread.
+    /// Do not disturb is enabled. Right side.
     #[value(name = "dnd")]
     Dnd,
 }
 
-/// Per-glyph rendering adjustments.
-///
-/// Icon outlines fill very different amounts of their em box: a battery is
-/// wide and short, bluetooth is tall and narrow, and a dot is small all over.
-/// One global text size cannot make all of them legible in a 12 px island, so
-/// each glyph carries its own optical configuration.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GlyphStyle {
-    /// Horizontal room this glyph claims on the island.
-    ///
-    /// The clock is centered by the flexible space that remains between the
-    /// slots, so adding a single occupied side moves it by half this value.
-    /// Widths differ per glyph because icon outlines do: a battery is much
-    /// wider than a notification dot.
-    pub slot_width: f32,
-    /// Empty strip between the island edge and the glyph.
-    ///
-    /// Anchoring the glyph inward, instead of centering it in the slot, keeps
-    /// the outer margin consistent and leaves the remaining slack on the clock
-    /// side.
-    pub inset: f32,
-    /// Font size in px. Text glyphs use it directly; rotated glyphs use it as
-    /// the edge of their square SVG box.
-    pub size: f32,
-    /// How far to raise the glyph for optical centering, in px. The slot
-    /// applies twice this value as bottom padding.
-    pub rise: f32,
-    /// Clockwise rotation in degrees. Non-zero values are rendered through an
-    /// inline SVG because gpui text elements cannot be transformed.
-    pub rotation: f32,
-}
-
 impl Glyph {
-    /// Every glyph, ordered by side and then visually.
+    /// Every glyph, in overview order: machine state first, then the inbox.
     pub const ALL: [Glyph; 5] = [
         Glyph::BatteryLow,
         Glyph::WifiDown,
@@ -107,21 +121,6 @@ impl Glyph {
         }
     }
 
-    /// Lower values win when several glyphs on the same side are active.
-    ///
-    /// Priorities are only compared within a side. A failing machine signal
-    /// outranks a quieter one, and DND outranks unread because it explains why
-    /// new notifications may not be surfacing.
-    pub fn priority(self) -> u8 {
-        match self {
-            Glyph::BatteryLow => 0,
-            Glyph::WifiDown => 1,
-            Glyph::BluetoothOff => 2,
-            Glyph::Dnd => 0,
-            Glyph::Unread => 1,
-        }
-    }
-
     /// Nerd Font private-use codepoint for the glyph.
     pub fn icon(self) -> &'static str {
         match self {
@@ -133,54 +132,14 @@ impl Glyph {
         }
     }
 
-    /// Per-glyph size, optical offset, and rotation.
-    ///
-    /// The battery is deliberately large: its outline is wide and short, so it
-    /// fills the slot without exceeding the island's height. Squarer and
-    /// taller icons have to be smaller to avoid looking oversized. Bluetooth
-    /// is a tall rune, so it is rotated to lie across the slot instead.
-    pub fn style(self) -> GlyphStyle {
+    /// Readable name shown next to the icon on the overview.
+    pub fn label(self) -> &'static str {
         match self {
-            Glyph::BatteryLow => GlyphStyle {
-                slot_width: 16.0,
-                inset: 8.0,
-                size: 18.0,
-                rise: 0.0,
-                rotation: 0.0,
-            },
-            Glyph::WifiDown => GlyphStyle {
-                slot_width: 16.0,
-                inset: 8.0,
-                size: 16.0,
-                rise: 1.0,
-                rotation: 0.0,
-            },
-            Glyph::BluetoothOff => GlyphStyle {
-                // The rotated rune is long and shallow. Give it a wider slot
-                // and fill the SVG box more completely so it does not read as
-                // small next to the battery.
-                slot_width: 24.0,
-                inset: 8.0,
-                size: 20.0,
-                rise: 0.0,
-                rotation: 90.0,
-            },
-            Glyph::Unread => GlyphStyle {
-                // A dot needs very little room; a full-width slot would leave
-                // it stranded far from the clock.
-                slot_width: 10.0,
-                inset: 5.0,
-                size: 10.0,
-                rise: 0.0,
-                rotation: 0.0,
-            },
-            Glyph::Dnd => GlyphStyle {
-                slot_width: 16.0,
-                inset: 8.0,
-                size: 16.0,
-                rise: 1.0,
-                rotation: 0.0,
-            },
+            Glyph::BatteryLow => "Battery low",
+            Glyph::WifiDown => "Wifi down",
+            Glyph::BluetoothOff => "Bluetooth off",
+            Glyph::Unread => "Unread",
+            Glyph::Dnd => "Do not disturb",
         }
     }
 
@@ -210,21 +169,20 @@ impl Glyph {
     }
 }
 
-/// The set of active glyphs, stored as a bitmask so `Settings` stays cheap to
-/// copy. Inactive glyphs still count towards the side's priority resolution.
+/// The set of active detailed glyphs, stored as a bitmask so `Settings` stays
+/// cheap to copy.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GlyphSlots {
     active: u16,
 }
 
 impl GlyphSlots {
-    /// Activates `glyph` without touching the other glyphs on its side.
+    /// Activates `glyph` without touching the other glyphs.
     pub fn set(&mut self, glyph: Glyph) {
         self.active |= glyph.bit();
     }
 
-    /// Deactivates `glyph`, revealing the next-highest priority glyph on its
-    /// side, if any.
+    /// Deactivates `glyph`.
     pub fn clear(&mut self, glyph: Glyph) {
         self.active &= !glyph.bit();
     }
@@ -242,36 +200,11 @@ impl GlyphSlots {
         self.active & glyph.bit() != 0
     }
 
-    /// The glyph currently occupying `side`, if any.
-    pub fn visible(self, side: Side) -> Option<Glyph> {
+    /// Every active glyph, in overview order.
+    pub fn active(self) -> impl Iterator<Item = Glyph> {
         Glyph::ALL
             .into_iter()
-            .filter(|glyph| glyph.side() == side && self.is_active(*glyph))
-            .min_by_key(|glyph| glyph.priority())
-    }
-
-    /// Whether `side`'s slot is occupied, and therefore claims width.
-    #[allow(dead_code)]
-    pub fn occupied(self, side: Side) -> bool {
-        self.visible(side).is_some()
-    }
-
-    /// Number of occupied slots (0, 1, or 2).
-    #[allow(dead_code)]
-    pub fn occupied_count(self) -> usize {
-        [Side::Left, Side::Right]
-            .into_iter()
-            .filter(|&side| self.occupied(side))
-            .count()
-    }
-
-    /// Extra width the occupied slots require on top of the compact size.
-    pub fn extra_width(self) -> f32 {
-        [Side::Left, Side::Right]
-            .into_iter()
-            .filter_map(|side| self.visible(side))
-            .map(|glyph| glyph.style().slot_width)
-            .sum()
+            .filter(move |glyph| self.is_active(*glyph))
     }
 }
 
@@ -289,35 +222,19 @@ mod tests {
     }
 
     #[test]
-    fn higher_priority_glyph_wins_within_a_side() {
+    fn active_lists_every_set_glyph() {
         let mut slots = GlyphSlots::default();
+        assert_eq!(slots.active().count(), 0);
+
         slots.set(Glyph::BluetoothOff);
-        slots.set(Glyph::WifiDown);
-        assert_eq!(slots.visible(Side::Left), Some(Glyph::WifiDown));
-
-        slots.set(Glyph::BatteryLow);
-        assert_eq!(slots.visible(Side::Left), Some(Glyph::BatteryLow));
-
-        slots.clear(Glyph::BatteryLow);
-        assert_eq!(slots.visible(Side::Left), Some(Glyph::WifiDown));
-    }
-
-    #[test]
-    fn sides_are_independent() {
-        let mut slots = GlyphSlots::default();
-        slots.set(Glyph::BatteryLow);
         slots.set(Glyph::Unread);
-
-        assert_eq!(slots.occupied_count(), 2);
         assert_eq!(
-            slots.extra_width(),
-            Glyph::BatteryLow.style().slot_width + Glyph::Unread.style().slot_width
+            slots.active().collect::<Vec<_>>(),
+            vec![Glyph::BluetoothOff, Glyph::Unread]
         );
 
         slots.clear_side(Side::Left);
-        assert_eq!(slots.visible(Side::Left), None);
-        assert_eq!(slots.visible(Side::Right), Some(Glyph::Unread));
-        assert_eq!(slots.extra_width(), Glyph::Unread.style().slot_width);
+        assert_eq!(slots.active().collect::<Vec<_>>(), vec![Glyph::Unread]);
     }
 
     #[test]
@@ -325,6 +242,26 @@ mod tests {
         let mut slots = GlyphSlots::default();
         slots.set(Glyph::Unread);
         slots.clear(Glyph::Dnd);
-        assert_eq!(slots.visible(Side::Right), Some(Glyph::Unread));
+        assert_eq!(slots.active().collect::<Vec<_>>(), vec![Glyph::Unread]);
+    }
+
+    #[test]
+    fn severity_runs_from_none_to_critical() {
+        assert!(Severity::None < Severity::Info);
+        assert!(Severity::Info < Severity::Warn);
+        assert!(Severity::Warn < Severity::Critical);
+    }
+
+    #[test]
+    fn only_a_visible_severity_claims_width() {
+        assert_eq!(Severity::None.slot_width(), 0.0);
+        assert_eq!(Severity::Info.slot_width(), Severity::SLOT_WIDTH);
+        assert_eq!(Severity::Warn.slot_width(), Severity::SLOT_WIDTH);
+        assert_eq!(Severity::Critical.slot_width(), Severity::SLOT_WIDTH);
+
+        assert!(Severity::None.icon().is_none());
+        assert!(Severity::Info.icon().is_some());
+        assert!(Severity::Warn.icon().is_some());
+        assert!(Severity::Critical.icon().is_some());
     }
 }

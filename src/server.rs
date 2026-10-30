@@ -141,7 +141,8 @@ pub fn run() {
     });
 }
 
-/// Shows or hides a glyph, growing the island if the visible slot changed.
+/// Shows or hides a detailed glyph. Glyphs no longer change the compact size
+/// (they are only drawn on the overview), but the overview still has to redraw.
 fn set_glyph(cx: &mut App, glyph: Glyph, active: bool) {
     {
         let settings = cx.global_mut::<Settings>();
@@ -382,22 +383,28 @@ fn apply_command(cx: &mut App, command: Command) {
         }
         Command::Color { color } => cx.global_mut::<Settings>().target.background = color,
         Command::TextColor { color } => cx.global_mut::<Settings>().target.text_color = color,
-        Command::Glyph { action } => {
+        Command::Status { severity } => {
             {
                 let settings = cx.global_mut::<Settings>();
-                match action {
-                    GlyphAction::Set { glyph, .. } => settings.glyphs.set(glyph),
-                    GlyphAction::Clear { side, glyph } => match glyph {
-                        Some(glyph) => settings.glyphs.clear(glyph),
-                        None => settings.glyphs.clear_side(side),
-                    },
-                }
-                // Occupied slots widen the compact island; the animator
+                settings.severity = severity;
+                // The dot claims room on the right of the clock; the animator
                 // eases to the new target like any other resize.
                 let target = settings.target_size();
                 settings.target.size = target;
             }
             grow_surface(cx);
+        }
+        Command::Glyph { action } => {
+            let settings = cx.global_mut::<Settings>();
+            match action {
+                GlyphAction::Set { glyph, .. } => settings.glyphs.set(glyph),
+                GlyphAction::Clear { side, glyph } => match glyph {
+                    Some(glyph) => settings.glyphs.clear(glyph),
+                    None => settings.glyphs.clear_side(side),
+                },
+            }
+            // Detailed glyphs only appear on the overview, so the compact size
+            // is unchanged. The redraw is requested by `start_animation`.
         }
         Command::Overview => open_overlay(cx, IslandMode::Overview),
         Command::Launcher => open_overlay(cx, IslandMode::Launcher),
@@ -587,7 +594,7 @@ fn surface_size(current: Size<Pixels>, target: Size<Pixels>) -> Size<Pixels> {
 fn resize_windows(cx: &mut App, size: Size<Pixels>) {
     let (normal_size, overlay_engaged) = {
         let settings = cx.global::<Settings>();
-        (settings.normal_size_with_glyphs(), settings.overlay_engaged)
+        (settings.normal_size_with_status(), settings.overlay_engaged)
     };
 
     for handle in island_windows(cx) {

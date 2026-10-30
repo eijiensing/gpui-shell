@@ -2,14 +2,14 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
 use gpui::{
-    AnyElement, Context, FocusHandle, Hsla, KeyDownEvent, Render, ScrollHandle, Transformation,
-    Window, div, prelude::*, px, radians, svg,
+    AnyElement, Context, FocusHandle, Hsla, KeyDownEvent, Render, ScrollHandle, Window, div,
+    prelude::*, px,
 };
 
 use crate::animation::Animation;
 use crate::appearance::{Appearance, IslandMode, NORMAL_TEXT_SIZE, Settings, TEXT_FONT_FAMILY};
 use crate::audio::{self, Volume};
-use crate::glyphs::{self, Glyph, GlyphStyle, Side};
+use crate::glyphs::{self, Glyph, Severity};
 use crate::launcher::Catalog;
 use crate::notifications::{self, Notification, Urgency};
 use crate::process::Processes;
@@ -1519,16 +1519,17 @@ impl Island {
         .detach();
     }
 
-    /// The compact clock/volume view, flanked by the two glyph slots.
+    /// The compact clock/volume view, with the status dot to its right.
     ///
-    /// The flexible center means both slots occupied keeps the text centered,
-    /// while a single occupied slot moves it half a slot towards the other
-    /// side (the extra width all ends up on one side).
+    /// The clock is centered in whatever room the dot leaves, so the island
+    /// grows to the right when a severity is active. The dot is only part of
+    /// the clock/volume state; a notification summary replaces both, so it is
+    /// hidden while a toast is on screen.
     fn render_normal(&self, cx: &Context<Self>) -> AnyElement {
-        let (glyphs, text_color, toast) = {
+        let (severity, text_color, toast) = {
             let settings = cx.global::<Settings>();
             (
-                settings.glyphs,
+                settings.severity,
                 settings.current.text_color,
                 settings.toast.as_ref().map(|toast| toast.summary.clone()),
             )
@@ -1542,55 +1543,32 @@ impl Island {
             NormalIndicator::Volume(Volume::Percent(percent)) => format!("{percent}%"),
         };
 
-        let left = glyphs.visible(Side::Left);
-        // The inbox glyphs describe notifications that the toast is already
-        // showing, so they would only compete with the summary for width.
-        let right = if showing_toast {
-            None
-        } else {
-            glyphs.visible(Side::Right)
-        };
-
-        let mut center = div()
+        let center = div()
             .flex_1()
             .min_w_0()
             .overflow_hidden()
             .flex()
             .items_center()
-            .justify_center();
-        // Unequal slot widths move the flexible center off the island's
-        // midpoint. When both sides are occupied the clock should stay
-        // centered, so pad the wider side's edge to cancel half the
-        // difference. With only one occupied side the half-slot offset is
-        // intentional and is left alone.
-        if let (Some(left), Some(right)) = (left, right) {
-            let left_width = left.style().slot_width;
-            let right_width = right.style().slot_width;
-            if left_width > right_width {
-                center = center.pr(px(left_width - right_width));
-            } else if right_width > left_width {
-                center = center.pl(px(right_width - left_width));
-            }
-        }
-        center = center.child(
-            div()
-                .min_w_0()
-                .whitespace_nowrap()
-                .overflow_hidden()
-                .text_ellipsis()
-                .child(text),
-        );
+            .justify_center()
+            .child(
+                div()
+                    .min_w_0()
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(text),
+            );
 
-        let mut row = div().flex().flex_row().items_center().w_full().h_full();
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .w_full()
+            .h_full()
+            .child(center);
 
-        if let Some(glyph) = left {
-            row = row.child(glyph_slot(glyph, Side::Left, text_color));
-        }
-
-        row = row.child(center);
-
-        if let Some(glyph) = right {
-            row = row.child(glyph_slot(glyph, Side::Right, text_color));
+        if !showing_toast && let Some(icon) = severity.icon() {
+            row = row.child(status_dot(icon, text_color));
         }
 
         row.into_any_element()
@@ -1737,6 +1715,8 @@ impl Island {
 
         let hint = "←/→ select · Enter open · or press L / T / N · esc close";
 
+        let active: Vec<Glyph> = cx.global::<Settings>().glyphs.active().collect();
+
         div()
             .flex()
             .flex_col()
@@ -1746,6 +1726,7 @@ impl Island {
             .track_focus(&self.overview.focus)
             .on_key_down(cx.listener(Self::on_key_down))
             .child(div().text_xs().text_color(colors.muted).child("Overview"))
+            .child(overview_status(active, colors))
             .child(
                 div()
                     .flex()
@@ -2414,6 +2395,7 @@ struct TrayColors {
     border: Hsla,
     selection: Hsla,
     danger: Hsla,
+    warning: Hsla,
 }
 
 fn tray_colors(progress: f32, island: Appearance) -> TrayColors {
@@ -2424,6 +2406,66 @@ fn tray_colors(progress: f32, island: Appearance) -> TrayColors {
         border: island.text_color.opacity(alpha * 0.25),
         selection: island.text_color.opacity(alpha * 0.15),
         danger: gpui::red().opacity(alpha),
+        warning: gpui::yellow().opacity(alpha),
+    }
+}
+
+/// The detailed conditions shown on the overview, or a calm note when none
+/// are active.
+///
+/// This is the place to see *what* is wrong, while the compact dot only says
+/// how urgent it is.
+fn overview_status(active: Vec<Glyph>, colors: TrayColors) -> AnyElement {
+    if active.is_empty() {
+        return div()
+            .flex_shrink_0()
+            .text_xs()
+            .text_color(colors.muted)
+            .child("All clear")
+            .into_any_element();
+    }
+
+    div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .items_center()
+        .gap_x(px(12.0))
+        .gap_y(px(4.0))
+        .flex_shrink_0()
+        .children(active.into_iter().map(|glyph| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .font_family(glyphs::FONT_FAMILY)
+                        .text_size(px(14.0))
+                        .line_height(px(14.0))
+                        .text_color(glyph_tint(glyph, colors))
+                        .child(glyph.icon()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(colors.muted)
+                        .whitespace_nowrap()
+                        .child(glyph.label()),
+                )
+                .into_any_element()
+        }))
+        .into_any_element()
+}
+
+/// Colours the detailed glyphs so urgent conditions stand out from informative
+/// ones at a glance.
+fn glyph_tint(glyph: Glyph, colors: TrayColors) -> Hsla {
+    match glyph {
+        Glyph::BatteryLow => colors.danger,
+        Glyph::WifiDown => colors.warning,
+        Glyph::BluetoothOff | Glyph::Unread | Glyph::Dnd => colors.text,
     }
 }
 
@@ -2468,93 +2510,32 @@ fn relative_time(now: DateTime<Local>, received: DateTime<Local>) -> String {
     }
 }
 
-/// One occupied glyph slot.
+/// The single severity dot drawn to the right of the clock.
 ///
-/// The per-glyph slot width is what makes a single occupied side shift the
-/// clock by half that width. Inside it the glyph is anchored to the island edge
-/// with the glyph's own inset (and may overflow the nominal slot towards the
-/// clock, where there is blank space). Glyphs use a Nerd Font family so the
-/// private-use codepoints resolve even when the body face is a plain monospace
-/// build.
-fn glyph_slot(glyph: Glyph, side: Side, color: Hsla) -> AnyElement {
-    let style = glyph.style();
-    let inset = div().w(px(style.inset)).h_full().flex_shrink_0();
-    let icon = if style.rotation == 0.0 {
-        div()
-            .flex_shrink_0()
-            .whitespace_nowrap()
-            .text_size(px(style.size))
-            .line_height(px(style.size))
-            .child(glyph.icon())
-            .into_any_element()
-    } else {
-        rotated_glyph(glyph, style, color)
-    };
-
-    let slot = match side {
-        Side::Left => div()
-            .w(px(style.slot_width))
-            .h_full()
-            .flex_shrink_0()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_start()
-            .child(inset)
-            .child(icon),
-        Side::Right => div()
-            .w(px(style.slot_width))
-            .h_full()
-            .flex_shrink_0()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_end()
-            .child(icon)
-            .child(inset),
-    };
-
-    slot.pb(px(style.rise * 2.0))
+/// The slot is narrow and fully occupied by the icon so the clock keeps its
+/// visual weight; `severity.slot_width()` reserves exactly this much room. The
+/// dot uses the Nerd Font family so the private-use codepoint resolves even
+/// when the body face is a plain monospace build.
+fn status_dot(icon: &'static str, color: Hsla) -> AnyElement {
+    div()
+        .w(px(Severity::SLOT_WIDTH))
+        .h_full()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
         .font_family(glyphs::FONT_FAMILY)
-        .into_any_element()
-}
-
-/// Renders a font glyph through an inline SVG so it can be rotated.
-///
-/// gpui text elements cannot be transformed, but its SVG renderer resolves
-/// `<text>` through the system font database into a monochrome alpha mask and
-/// supports a rotation transform. The glyph therefore stays the same Nerd Font
-/// icon while lying across a short slot.
-fn rotated_glyph(glyph: Glyph, style: GlyphStyle, color: Hsla) -> AnyElement {
-    let data = rotated_glyph_svg(glyph);
-
-    svg()
-        .data(data.as_bytes())
-        .w(px(style.size))
-        .h(px(style.size))
+        .text_size(px(10.0))
+        .line_height(px(10.0))
         .text_color(color)
-        .with_transformation(Transformation::rotate(radians(style.rotation.to_radians())))
+        .child(icon)
         .into_any_element()
-}
-
-/// The inline SVG that lets a font glyph be rotated.
-fn rotated_glyph_svg(glyph: Glyph) -> String {
-    format!(
-        concat!(
-            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">"#,
-            r#"<text x="50" y="50" font-family="{}" font-size="100" "#,
-            r#"text-anchor="middle" dominant-baseline="central">{}</text>"#,
-            r#"</svg>"#,
-        ),
-        glyphs::FONT_FAMILY,
-        glyph.icon()
-    )
 }
 
 /// How far the island has travelled from the normal size towards the expanded
 /// overlay size, in `0..=1`.
 fn overlay_progress(settings: &Settings) -> f32 {
-    let normal = f32::from(settings.normal_size_with_glyphs().height);
+    let normal = f32::from(settings.normal_size_with_status().height);
     let expanded = f32::from(settings.overlay_size.height);
     let current = f32::from(settings.current.size.height);
 
@@ -2590,7 +2571,7 @@ impl Render for Island {
                 settings.current,
                 settings.mode,
                 settings.overlay_mode,
-                settings.normal_size_with_glyphs(),
+                settings.normal_size_with_status(),
                 overlay_progress(settings),
                 settings.overlay_engaged,
             )
@@ -2691,31 +2672,6 @@ mod tests {
     use chrono::{Duration, TimeZone};
 
     use super::*;
-
-    #[test]
-    fn rotated_glyph_svg_embeds_the_font_and_icon() {
-        let data = rotated_glyph_svg(Glyph::BluetoothOff);
-
-        assert!(data.starts_with("<svg"));
-        assert!(data.ends_with("</svg>"));
-        assert!(data.contains(glyphs::FONT_FAMILY));
-        assert!(data.contains(Glyph::BluetoothOff.icon()));
-        // Raw attribute quoting, not escaped quotes from a formatted string.
-        assert!(!data.contains("\\\""));
-    }
-
-    #[test]
-    fn glyph_styles_are_configured_per_glyph() {
-        let battery = Glyph::BatteryLow.style();
-        let wifi = Glyph::WifiDown.style();
-        let bluetooth = Glyph::BluetoothOff.style();
-
-        assert!(battery.size > wifi.size);
-        assert_eq!(battery.rotation, 0.0);
-        assert_eq!(bluetooth.rotation, 90.0);
-        assert!(bluetooth.slot_width > battery.slot_width);
-        assert!(Glyph::Unread.style().slot_width < battery.slot_width);
-    }
 
     #[test]
     fn overview_commands_are_reachable_by_their_initial() {

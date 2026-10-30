@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use gpui::Hsla;
 
-use crate::glyphs::{Glyph, Side};
+use crate::glyphs::{Glyph, Severity, Side};
 
 /// A layer-shell island whose appearance can be driven from the command line.
 ///
@@ -62,12 +62,26 @@ pub enum Command {
     /// owns it, the panel reports that.
     Notifications,
 
-    /// Manage the glyphs shown in the island's side slots.
+    /// Set the compact status dot drawn to the right of the clock.
     ///
-    /// The left slot is reserved for machine state (battery, wifi, bluetooth)
-    /// and the right slot for the inbox (unread, do not disturb). Each side
-    /// shows only its highest-priority active glyph; setting another glyph on
-    /// the same side leaves the existing one active underneath it.
+    /// The dot has four stages: `none`, `info`, `warn`, and `critical`. It is
+    /// visible whenever the bar shows the clock or the volume indicator, and
+    /// hidden while a notification summary or an overlay is on screen.
+    ///
+    /// Examples:
+    ///   gpui-shell status info
+    ///   gpui-shell status critical
+    ///   gpui-shell status none
+    Status {
+        /// Stage to show; `none` removes the dot.
+        severity: Severity,
+    },
+
+    /// Manage the detailed conditions listed on the overview screen.
+    ///
+    /// Each glyph belongs to a side (machine state or inbox), which keeps the
+    /// command shape stable, but the compact bar no longer draws them: open
+    /// the overview to see every active condition with a readable label.
     ///
     /// Examples:
     ///   gpui-shell glyph set left battery-low

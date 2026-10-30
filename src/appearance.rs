@@ -1,6 +1,6 @@
 use gpui::{Global, Hsla, Pixels, Size, px};
 
-use crate::glyphs::{FONT_FAMILY, GlyphSlots, Side};
+use crate::glyphs::{FONT_FAMILY, GlyphSlots, Severity};
 
 /// Number of scalar channels the animator drives: the two size components and
 /// the hue/saturation/lightness/alpha of each color.
@@ -51,7 +51,7 @@ pub struct Toast {
     /// Summary text (already flattened to a single line).
     pub summary: String,
     /// Width in px of the summary at the bar's text size, including horizontal
-    /// breathing room but excluding any machine glyph on the left.
+    /// breathing room but excluding the status dot on the right.
     pub width: Pixels,
 }
 
@@ -149,11 +149,13 @@ pub struct Settings {
     /// closing starts, so the overlay content can stay visible while the island
     /// contracts.
     pub overlay_mode: IslandMode,
-    /// Compact size used by normal mode, excluding glyph slots; the `resize`
-    /// command updates this.
+    /// Compact size used by normal mode, excluding the status dot; the
+    /// `resize` command updates this.
     pub normal_size: Size<Pixels>,
-    /// Conditions currently signalled in the two glyph slots.
+    /// Detailed conditions listed on the overview screen.
     pub glyphs: GlyphSlots,
+    /// Coarse health dot drawn to the right of the clock.
+    pub severity: Severity,
     /// Notification summary currently replacing the clock, if any.
     pub toast: Option<Toast>,
     /// Size the currently open overlay is expanding to.
@@ -183,29 +185,24 @@ impl Settings {
             overlay_mode: IslandMode::Normal,
             normal_size: appearance.size,
             glyphs: GlyphSlots::default(),
+            severity: Severity::None,
             toast: None,
             overlay_size: appearance.size,
             overlay_engaged: false,
         }
     }
 
-    /// Compact size plus room for the glyph slots that are actually visible
-    /// and for an active notification toast.
+    /// Compact size plus room for the status dot and for an active notification
+    /// toast.
     ///
-    /// Inbox glyphs (unread, do-not-disturb) are hidden while a toast is on
-    /// screen because the summary already conveys the notification. A machine
-    /// glyph on the left keeps its slot, so the summary still fits beside it.
-    pub fn normal_size_with_glyphs(&self) -> Size<Pixels> {
+    /// The dot is only drawn while normal mode shows the clock or the volume
+    /// indicator. A toast replaces both, so it hides the dot and the island
+    /// only has to fit the measured summary.
+    pub fn normal_size_with_status(&self) -> Size<Pixels> {
         let base = f32::from(self.normal_size.width);
         let width = match &self.toast {
-            Some(toast) => {
-                let left = self
-                    .glyphs
-                    .visible(Side::Left)
-                    .map_or(0.0, |glyph| glyph.style().slot_width);
-                base.max(left + f32::from(toast.width))
-            }
-            None => base + self.glyphs.extra_width(),
+            Some(toast) => base.max(f32::from(toast.width)),
+            None => base + self.severity.slot_width(),
         };
         Size::new(px(width), self.normal_size.height)
     }
@@ -218,7 +215,7 @@ impl Settings {
             IslandMode::Tray => tray_size(),
             IslandMode::Notifications => notifications_size(),
             // The calendar is not implemented; it reuses the normal size for now.
-            IslandMode::Normal | IslandMode::Calendar => self.normal_size_with_glyphs(),
+            IslandMode::Normal | IslandMode::Calendar => self.normal_size_with_status(),
         }
     }
 }
@@ -229,38 +226,33 @@ mod tests {
     use crate::glyphs::Glyph;
 
     #[test]
-    fn each_occupied_side_adds_its_glyphs_slot_width() {
-        let mut settings = Settings::new();
-        let base = settings.normal_size;
-        let battery = Glyph::BatteryLow.style().slot_width;
-        let unread = Glyph::Unread.style().slot_width;
-
-        assert_eq!(settings.target_size(), base);
-
-        settings.glyphs.set(Glyph::BatteryLow);
-        assert_eq!(
-            settings.target_size(),
-            Size::new(px(f32::from(base.width) + battery), base.height)
-        );
-
-        settings.glyphs.set(Glyph::Unread);
-        assert_eq!(
-            settings.target_size(),
-            Size::new(px(f32::from(base.width) + battery + unread), base.height)
-        );
-
-        // A lower-priority glyph on an occupied side does not add width.
-        settings.glyphs.set(Glyph::WifiDown);
-        assert_eq!(
-            settings.target_size(),
-            Size::new(px(f32::from(base.width) + battery + unread), base.height)
-        );
+    fn severity_none_keeps_the_compact_size() {
+        let settings = Settings::new();
+        assert_eq!(settings.target_size(), settings.normal_size);
     }
 
     #[test]
-    fn a_toast_fits_its_summary_and_hides_inbox_glyphs() {
+    fn an_active_severity_makes_room_for_the_dot() {
         let mut settings = Settings::new();
-        settings.glyphs.set(Glyph::Unread);
+        let base = settings.normal_size;
+
+        settings.severity = Severity::Warn;
+        assert_eq!(
+            settings.target_size(),
+            Size::new(
+                px(f32::from(base.width) + Severity::SLOT_WIDTH),
+                base.height
+            )
+        );
+
+        settings.severity = Severity::None;
+        assert_eq!(settings.target_size(), base);
+    }
+
+    #[test]
+    fn a_toast_fits_its_summary_and_hides_the_dot() {
+        let mut settings = Settings::new();
+        settings.severity = Severity::Critical;
         let without_toast = settings.target_size();
 
         settings.toast = Some(Toast {
@@ -270,22 +262,20 @@ mod tests {
         let with_toast = settings.target_size();
 
         assert_eq!(with_toast.height, without_toast.height);
-        // The unread glyph makes way for the summary, so only the measured
-        // text width (already above the compact clock width) is used.
+        // The dot makes way for the summary, so only the measured text width
+        // is used.
         assert_eq!(with_toast.width, px(120.0));
 
-        // A machine glyph keeps its slot beside the toast.
-        settings.glyphs.set(Glyph::BatteryLow);
-        let battery = Glyph::BatteryLow.style().slot_width;
-        assert_eq!(settings.target_size().width, px(120.0 + battery));
-
         settings.toast = None;
-        assert_eq!(
-            settings.target_size(),
-            Size::new(
-                px(f32::from(without_toast.width) + battery),
-                without_toast.height
-            )
-        );
+        assert_eq!(settings.target_size(), without_toast);
+    }
+
+    #[test]
+    fn detailed_glyphs_no_longer_widen_the_bar() {
+        let mut settings = Settings::new();
+        settings.glyphs.set(Glyph::BatteryLow);
+        settings.glyphs.set(Glyph::Unread);
+
+        assert_eq!(settings.target_size(), settings.normal_size);
     }
 }
