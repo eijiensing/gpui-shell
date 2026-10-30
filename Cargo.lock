@@ -2078,6 +2078,8 @@ dependencies = [
  "gpui_platform",
  "libc",
  "pipewire",
+ "serde_json",
+ "uuid",
  "zbus",
 ]
 

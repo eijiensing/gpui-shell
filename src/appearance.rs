@@ -170,6 +170,11 @@ pub struct Settings {
     /// has settled. Bar surfaces stay compact while this is set, so the
     /// overlay's resize never reaches displays that are not hosting it.
     pub overlay_engaged: bool,
+    /// Name of the output whose focused window is fullscreen, if any.
+    ///
+    /// The bar on that output slides away before niri draws the fullscreen
+    /// window over the top layer. Bars on other outputs stay visible.
+    pub fullscreen_output: Option<String>,
 }
 
 impl Global for Settings {}
@@ -189,6 +194,7 @@ impl Settings {
             toast: None,
             overlay_size: appearance.size,
             overlay_engaged: false,
+            fullscreen_output: None,
         }
     }
 

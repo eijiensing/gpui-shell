@@ -16,6 +16,15 @@ const RESIZE_DURATION: f32 = 0.2;
 /// The curve the size follows while resizing.
 const RESIZE_EASING: Easing = Easing::EaseInOutSine;
 
+/// How long the bar takes to slide away for a fullscreen window. This is a
+/// little quicker than [`RESIZE_DURATION`] so it outpaces niri's fullscreen
+/// animation, which would otherwise cover the island before it finished
+/// hiding.
+const REVEAL_DURATION: f32 = 0.12;
+
+/// The curve the bar follows while sliding away.
+const REVEAL_EASING: Easing = Easing::EaseInOutSine;
+
 /// The first two channels are the island size; the remainder are colors.
 const SIZE_CHANNELS: usize = 2;
 const COLOR_CHANNELS: usize = CHANNELS - SIZE_CHANNELS;
@@ -96,6 +105,8 @@ impl Animator {
 /// sync.
 pub struct Animation {
     animator: Animator,
+    /// Vertical reveal of the bar, from `0.0` (hidden) to `1.0` (fully shown).
+    reveal: RevealTween,
     /// When the animator was last advanced; `None` until the first tick after a
     /// request, so idle time never produces a jump.
     last_tick: Option<Instant>,
@@ -108,9 +119,19 @@ impl Animation {
     pub fn new(initial: Appearance) -> Self {
         Self {
             animator: Animator::new(initial),
+            reveal: RevealTween::settled(1.0),
             last_tick: None,
             running: false,
         }
+    }
+
+    /// Retargets the bar's reveal.
+    ///
+    /// Returns whether the target changed, so the caller can start the
+    /// animation only when there is something to do. Retargeting mid-flight
+    /// continues from the current reveal instead of jumping.
+    pub fn set_revealed(&mut self, revealed: bool) -> bool {
+        self.reveal.set_target(if revealed { 1.0 } else { 0.0 })
     }
 
     /// Marks the animation as in flight.
@@ -135,9 +156,9 @@ impl Animation {
     /// tick. The first call after [`Self::request`] keeps the current appearance
     /// (it uses a zero delta), so the starting state is presented before motion
     /// begins.
-    pub fn tick(&mut self, target: Appearance, now: Instant) -> (Appearance, bool) {
+    pub fn tick(&mut self, target: Appearance, now: Instant) -> (Appearance, f32, bool) {
         if !self.running {
-            return (self.animator.value(), false);
+            return (self.animator.value(), self.reveal.current, false);
         }
 
         let dt = self
@@ -146,12 +167,16 @@ impl Animation {
             .unwrap_or(0.0);
         self.last_tick = Some(now);
 
-        if self.animator.advance(target, dt) {
+        let mut settled = self.animator.advance(target, dt);
+        settled &= self.reveal.advance(dt);
+
+        if settled {
             self.animator.snap_to(target);
+            self.reveal.snap();
             self.running = false;
-            (target, true)
+            (target, self.reveal.current, true)
         } else {
-            (self.animator.value(), false)
+            (self.animator.value(), self.reveal.current, false)
         }
     }
 }
@@ -207,6 +232,61 @@ impl SizeTween {
 
 fn lerp(from: f32, to: f32, progress: f32) -> f32 {
     from + (to - from) * progress
+}
+
+/// A fixed-duration tween for a single scalar, used to slide the bar away.
+struct RevealTween {
+    current: f32,
+    start: f32,
+    target: f32,
+    elapsed: f32,
+}
+
+impl RevealTween {
+    /// Creates a tween already resting at `value`.
+    fn settled(value: f32) -> Self {
+        Self {
+            current: value,
+            start: value,
+            target: value,
+            elapsed: REVEAL_DURATION,
+        }
+    }
+
+    /// Retargets the tween, returning whether the target changed.
+    fn set_target(&mut self, target: f32) -> bool {
+        if self.target == target {
+            return false;
+        }
+
+        // Continue from wherever the tween is now so a reversal made mid-flight
+        // slides back smoothly instead of jumping.
+        self.start = self.current;
+        self.target = target;
+        self.elapsed = 0.0;
+        true
+    }
+
+    /// Advances by `dt` seconds, returning whether the tween has finished.
+    fn advance(&mut self, dt: f32) -> bool {
+        if self.elapsed >= REVEAL_DURATION {
+            self.current = self.target;
+            return true;
+        }
+
+        self.elapsed = (self.elapsed + dt).min(REVEAL_DURATION);
+        let progress = REVEAL_EASING.apply(self.elapsed / REVEAL_DURATION);
+        self.current = lerp(self.start, self.target, progress);
+
+        self.elapsed >= REVEAL_DURATION
+    }
+
+    /// Snaps to the target, clearing any remaining travel.
+    fn snap(&mut self) {
+        self.current = self.target;
+        self.start = self.target;
+        self.elapsed = REVEAL_DURATION;
+    }
 }
 
 #[cfg(test)]
@@ -269,10 +349,11 @@ mod tests {
         // However long the app sat idle before the request, the first frame
         // stays at the starting size instead of jumping ahead.
         let now = Instant::now() + Duration::from_secs(10);
-        let (value, settled) = animation.tick(with_size(200.0, 100.0), now);
+        let (value, reveal, settled) = animation.tick(with_size(200.0, 100.0), now);
 
         assert!(!settled);
         assert_eq!(value.size, with_size(48.0, 12.0).size);
+        assert_eq!(reveal, 1.0);
         assert!(animation.running());
     }
 
@@ -284,19 +365,72 @@ mod tests {
 
         let start = Instant::now();
         animation.tick(target, start); // retargets with a zero delta
-        let (value, settled) = animation.tick(
+        let (value, reveal, settled) = animation.tick(
             target,
             start + Duration::from_secs_f32(RESIZE_DURATION / 2.0),
         );
 
         assert!(!settled);
         assert!((f32::from(value.size.width) - 124.0).abs() < 0.01);
+        assert!((reveal - 1.0).abs() < 0.01);
 
-        let (value, settled) =
+        let (value, reveal, settled) =
             animation.tick(target, start + Duration::from_secs_f32(RESIZE_DURATION));
 
         assert!(settled);
         assert_eq!(value.size, target.size);
+        assert_eq!(reveal, 1.0);
         assert!(!animation.running());
+    }
+
+    #[test]
+    fn hiding_the_bar_animates_without_changing_the_island_size() {
+        let mut animation = Animation::new(with_size(48.0, 12.0));
+        let target = with_size(48.0, 12.0);
+        assert!(animation.set_revealed(false));
+        animation.request();
+
+        let start = Instant::now();
+        let (_, reveal, settled) = animation.tick(target, start);
+        assert_eq!(reveal, 1.0);
+        assert!(!settled);
+
+        let (_, reveal, settled) = animation.tick(
+            target,
+            start + Duration::from_secs_f32(REVEAL_DURATION / 2.0),
+        );
+        assert!(!settled);
+        assert!((reveal - 0.5).abs() < 0.01);
+
+        let (value, reveal, settled) =
+            animation.tick(target, start + Duration::from_secs_f32(REVEAL_DURATION));
+        assert!(settled);
+        assert_eq!(value.size, target.size);
+        assert_eq!(reveal, 0.0);
+    }
+
+    #[test]
+    fn retargeting_the_reveal_continues_from_where_it_was() {
+        let mut animation = Animation::new(with_size(48.0, 12.0));
+        let target = with_size(48.0, 12.0);
+        animation.set_revealed(false);
+        animation.request();
+
+        let start = Instant::now();
+        animation.tick(target, start);
+        animation.tick(
+            target,
+            start + Duration::from_secs_f32(REVEAL_DURATION / 2.0),
+        );
+
+        assert!(!animation.set_revealed(false));
+        assert!(animation.set_revealed(true));
+
+        let (_, reveal, settled) = animation.tick(
+            target,
+            start + Duration::from_secs_f32(REVEAL_DURATION / 2.0),
+        );
+        assert!(!settled);
+        assert!((reveal - 0.5).abs() < 0.01);
     }
 }

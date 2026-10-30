@@ -9,6 +9,7 @@ mod glyphs;
 mod ipc;
 mod island;
 mod launcher;
+mod niri;
 mod notifications;
 mod process;
 mod server;

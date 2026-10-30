@@ -25,6 +25,8 @@ gpui_platform = {
 		rev = "af431aeef42704f277cda75aa9cf48b0778a7994"
 }
 pipewire = "0.10.1"
+serde_json = "1"
+uuid = { version = "1", features = ["v5"] }
 
 # gpui's layout, text shaping, and wgpu stack are too slow when built
 # unoptimized: animations visibly drop frames under `cargo run`. Optimize

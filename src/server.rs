@@ -93,6 +93,16 @@ pub fn run() {
         // glyph in step with the notification store.
         start_notification_toasts(cx);
 
+        // Slide the focused output's bar out of the way while a niri window
+        // there is fullscreen, before niri draws the window over the top layer.
+        let fullscreen_rx = crate::niri::subscribe();
+        cx.spawn(async move |cx| {
+            while let Ok(fullscreen) = fullscreen_rx.recv().await {
+                cx.update(|cx| set_fullscreen(cx, fullscreen));
+            }
+        })
+        .detach();
+
         // Consume commands, moving the target appearance or mode.
         cx.spawn(async move |cx| {
             while let Ok(command) = command_rx.recv().await {
@@ -162,6 +172,32 @@ fn set_glyph(cx: &mut App, glyph: Glyph, active: bool) {
 
     grow_surface(cx);
     start_animation(cx);
+}
+
+/// Hides or reveals the bar on the output whose focused window is
+/// fullscreen.
+///
+/// The reveal is its own animation channel, so it does not disturb the shared
+/// island size: an overlay opened while fullscreen still expands normally from
+/// the hidden bar.
+fn set_fullscreen(cx: &mut App, fullscreen_output: Option<String>) {
+    let hidden = fullscreen_output.is_some();
+    let output_changed = {
+        let settings = cx.global_mut::<Settings>();
+        if settings.fullscreen_output == fullscreen_output {
+            false
+        } else {
+            settings.fullscreen_output = fullscreen_output;
+            true
+        }
+    };
+    let reveal_changed = cx.global_mut::<Animation>().set_revealed(!hidden);
+
+    // A different output can take over the fullscreen state without changing
+    // the reveal target; the affected bars still need one frame to redraw.
+    if output_changed || reveal_changed {
+        start_animation(cx);
+    }
 }
 
 /// Subscribes to notification changes and drives the toast queue.
@@ -641,7 +677,7 @@ fn open_bar_window(cx: &mut App, display_id: Option<DisplayId>) -> Option<Window
             }),
             ..Default::default()
         },
-        |_window, cx| cx.new(|cx| Island::new(IslandRole::Bar, cx)),
+        |_window, cx| cx.new(|cx| Island::new(IslandRole::Bar, display_id, cx)),
     )
     .ok()
 }
@@ -671,7 +707,7 @@ fn open_overlay_window(cx: &mut App) -> Option<WindowHandle<Island>> {
             }),
             ..Default::default()
         },
-        |_window, cx| cx.new(|cx| Island::new(IslandRole::Overlay, cx)),
+        |_window, cx| cx.new(|cx| Island::new(IslandRole::Overlay, None, cx)),
     )
     .ok()
 }

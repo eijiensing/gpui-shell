@@ -2,9 +2,10 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
 use gpui::{
-    AnyElement, Context, FocusHandle, Hsla, KeyDownEvent, Render, ScrollHandle, Window, div,
-    prelude::*, px,
+    AnyElement, App, Context, DisplayId, FocusHandle, Hsla, KeyDownEvent, Render, ScrollHandle,
+    Window, div, prelude::*, px,
 };
+use uuid::Uuid;
 
 use crate::animation::Animation;
 use crate::appearance::{Appearance, IslandMode, NORMAL_TEXT_SIZE, Settings, TEXT_FONT_FAMILY};
@@ -535,6 +536,12 @@ impl Overview {
 pub struct Island {
     /// What this surface is for.
     role: IslandRole,
+    /// Display this surface was opened for, if any.
+    ///
+    /// Kept separately from [`Window::display`] because the bar is created
+    /// before its surface has entered an output; the platform window's display
+    /// can still be unset on the first frames.
+    display_id: Option<DisplayId>,
     /// Current wall-clock time, refreshed once a second.
     time: String,
     /// What normal mode shows right now.
@@ -560,9 +567,10 @@ pub enum IslandRole {
 }
 
 impl Island {
-    pub fn new(role: IslandRole, cx: &mut Context<Self>) -> Self {
+    pub fn new(role: IslandRole, display_id: Option<DisplayId>, cx: &mut Context<Self>) -> Self {
         let island = Self {
             role,
+            display_id,
             time: Local::now().format("%H:%M").to_string(),
             indicator: NormalIndicator::Clock,
             generation: 0,
@@ -2601,6 +2609,21 @@ fn overlay_progress(settings: &Settings) -> f32 {
     ((current - normal) / (expanded - normal)).clamp(0.0, 1.0)
 }
 
+/// Whether this surface belongs to the output niri reports as fullscreen.
+///
+/// niri names outputs by their connector name, which the Wayland backend also
+/// uses as the basis of [`gpui::PlatformDisplay::uuid`].
+fn display_matches_output(cx: &App, display_id: Option<DisplayId>, output: &str) -> bool {
+    let Some(display_id) = display_id else {
+        return false;
+    };
+
+    let expected = Uuid::new_v5(&Uuid::NAMESPACE_DNS, output.as_bytes());
+    cx.displays().into_iter().any(|display| {
+        display.id() == display_id && display.uuid().is_ok_and(|uuid| uuid == expected)
+    })
+}
+
 impl Render for Island {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Advance the shared animation before building the tree so this frame
@@ -2608,7 +2631,7 @@ impl Render for Island {
         // from the compositor; this paces the animation on frame callbacks
         // instead of a fixed timer, keeping it in step with presentation.
         let target = cx.global::<Settings>().target;
-        let (animated, settled) = cx.global_mut::<Animation>().tick(target, Instant::now());
+        let (animated, reveal, settled) = cx.global_mut::<Animation>().tick(target, Instant::now());
         cx.global_mut::<Settings>().current = animated;
 
         if settled {
@@ -2619,7 +2642,16 @@ impl Render for Island {
             window.request_animation_frame();
         }
 
-        let (window_size, island, mode, overlay_mode, normal_size, progress, overlay_engaged) = {
+        let (
+            window_size,
+            island,
+            mode,
+            overlay_mode,
+            normal_size,
+            progress,
+            overlay_engaged,
+            fullscreen_output,
+        ) = {
             let settings = cx.global::<Settings>();
             (
                 settings.window_size,
@@ -2629,6 +2661,7 @@ impl Render for Island {
                 settings.normal_size_with_status(),
                 overlay_progress(settings),
                 settings.overlay_engaged,
+                settings.fullscreen_output.clone(),
             )
         };
 
@@ -2668,6 +2701,20 @@ impl Render for Island {
                 } else {
                     (window_size, island.size)
                 };
+                // Fullscreen slides the bar up against the top edge by
+                // collapsing its animated height. Only the bar on the output
+                // hosting the fullscreen window is affected; other displays
+                // keep their clock. The surface keeps its normal size so it
+                // can be reused when the overlay toggles.
+                let bar_reveal = if fullscreen_output
+                    .as_deref()
+                    .is_some_and(|output| display_matches_output(cx, self.display_id, output))
+                {
+                    reveal
+                } else {
+                    1.0
+                };
+                let box_size = gpui::Size::new(box_size.width, box_size.height * bar_reveal);
                 (surface, box_size, self.render_normal(cx))
             }
             IslandRole::Overlay => {
