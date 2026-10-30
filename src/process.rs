@@ -149,6 +149,25 @@ pub fn force_stop(pid: u32, start_time: u64) -> io::Result<()> {
     signal(pid, start_time, libc::SIGKILL)
 }
 
+/// Politely asks the process with `pid` to stop, looked up by PID alone.
+///
+/// This is the fallback for tray items whose menu has no quit action: the
+/// item's bus name tells us which process owns it, so there is no need to
+/// guess from a display name. The start time is read immediately before
+/// signalling so a PID recycled in the meantime is not hit.
+pub fn stop_pid(pid: u32) -> io::Result<()> {
+    if pid == std::process::id() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to signal this process",
+        ));
+    }
+
+    let stat = read_stat(pid)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "process is no longer running"))?;
+    signal(pid, stat.start_time, libc::SIGTERM)
+}
+
 fn signal(pid: u32, start_time: u64, signal: libc::c_int) -> io::Result<()> {
     // PID 0 would signal our whole process group and PID 1 is init.
     if pid <= 1 {
@@ -357,6 +376,12 @@ mod tests {
     #[test]
     fn scan_does_not_panic() {
         let _ = Processes::scan();
+    }
+
+    #[test]
+    fn stop_pid_refuses_self_and_init() {
+        assert!(super::stop_pid(std::process::id()).is_err());
+        assert!(super::stop_pid(1).is_err());
     }
 
     fn process(pid: u32, name: &str, command: &str) -> super::Process {

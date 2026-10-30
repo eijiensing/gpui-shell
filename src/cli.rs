@@ -46,9 +46,10 @@ pub enum Command {
 
     /// Expand the island into a StatusNotifierItem system tray.
     ///
-    /// Enter activates an item, Right opens its DBusMenu (where applications
-    /// usually expose Quit), and Tab switches to a fallback process list for
-    /// applications without a tray item. Invoking this while the tray is
+    /// Enter activates an item, Right opens its DBusMenu, and Delete quits the
+    /// selected application (through its own Quit/Exit menu entry when it has
+    /// one, otherwise with SIGTERM). Tab switches to a fallback process list
+    /// for applications without a tray item. Invoking this while the tray is
     /// already open does nothing.
     Tray,
 

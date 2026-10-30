@@ -450,8 +450,8 @@ fn filter_notifications(list: &[Notification], query: &str) -> Vec<usize> {
 
 /// A panel reachable from the overview hub.
 ///
-/// The declaration order is the order the squares are shown in, so the hub
-/// reads left to right like a small app dock.
+/// The declaration order is the order the rows are shown in, so the hub reads
+/// top to bottom like the launcher list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OverviewCommand {
     Launcher,
@@ -466,7 +466,7 @@ impl OverviewCommand {
         OverviewCommand::Notifications,
     ];
 
-    /// Caption shown under the square.
+    /// Caption shown next to the icon.
     fn label(self) -> &'static str {
         match self {
             OverviewCommand::Launcher => "Launcher",
@@ -475,7 +475,7 @@ impl OverviewCommand {
         }
     }
 
-    /// Nerd Font codepoint drawn inside the square.
+    /// Nerd Font codepoint drawn at the start of the row.
     fn icon(self) -> &'static str {
         match self {
             OverviewCommand::Launcher => "\u{f009}",
@@ -484,7 +484,7 @@ impl OverviewCommand {
         }
     }
 
-    /// Shortcut letter that opens this command directly.
+    /// Shortcut letter shown on the right of the row and handled as the hotkey.
     fn initial(self) -> char {
         match self {
             OverviewCommand::Launcher => 'l',
@@ -513,7 +513,7 @@ impl OverviewCommand {
 struct Overview {
     /// Focus target for key handling; the hub has no text field.
     focus: FocusHandle,
-    /// Index into [`OverviewCommand::ALL`] of the highlighted square.
+    /// Index into [`OverviewCommand::ALL`] of the highlighted row.
     selected: usize,
 }
 
@@ -586,7 +586,7 @@ impl Island {
         self.role
     }
 
-    /// Resets the overview hub to its first square. Called on the transient
+    /// Resets the overview hub to its first row. Called on the transient
     /// overlay surface when the overview is requested.
     pub fn prepare_overview(&mut self, cx: &mut Context<Self>) {
         self.overview.selected = 0;
@@ -976,6 +976,8 @@ impl Island {
                 }
                 return self.activate_selected(cx);
             }
+            // Quit the selected application without opening its menu.
+            "delete" => return self.quit_selected(cx),
             // Right opens the menu even for items that don't set ItemIsMenu.
             "right" => return self.open_selected_menu(cx),
             "up" => return self.move_item_selection(-1, cx),
@@ -1038,6 +1040,8 @@ impl Island {
                 return;
             }
             "enter" => return self.stop_selected(keystroke.modifiers.shift, cx),
+            // Delete is explicit enough to skip the arming press.
+            "delete" => return self.stop_selected_now(keystroke.modifiers.shift, cx),
             "up" => return self.move_process_selection(-1, cx),
             "down" => return self.move_process_selection(1, cx),
             "backspace" => {
@@ -1189,6 +1193,48 @@ impl Island {
 
     fn secondary_activate_selected(&mut self, cx: &mut Context<Self>) {
         self.send_item_command(true, cx);
+    }
+
+    /// Asks the selected application to quit.
+    ///
+    /// The item's own menu action is used when it has one, so the application
+    /// can save state and prompt; otherwise the process that owns the item's
+    /// bus name receives SIGTERM. The item removes itself from the tray once
+    /// its bus name loses its owner, so there is nothing to clean up here.
+    fn quit_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(item) = self.tray.selected_item() else {
+            return;
+        };
+        let service = item.service.clone();
+        let menu_path = item.menu_path.clone();
+
+        self.tray.message = Some(TrayMessage {
+            text: "Quitting…".to_string(),
+            error: false,
+        });
+        cx.notify();
+
+        let reply = status_notifier::quit(&service, menu_path.as_deref());
+        cx.spawn(async move |island, cx| {
+            let result = reply.recv().await;
+            island
+                .update(cx, |island, cx| {
+                    island.tray.message = Some(match result {
+                        Ok(Ok(text)) => TrayMessage { text, error: false },
+                        Ok(Err(err)) => TrayMessage {
+                            text: format!("Couldn't quit: {err}"),
+                            error: true,
+                        },
+                        Err(_) => TrayMessage {
+                            text: "quit request was cancelled".to_string(),
+                            error: true,
+                        },
+                    });
+                    cx.notify();
+                })
+                .ok();
+        })
+        .detach();
     }
 
     /// Sends Activate or SecondaryActivate to the selected item.
@@ -1348,12 +1394,21 @@ impl Island {
     /// makes a stray Enter harmless while keeping the common case to two keys.
     /// Shift forces the kill (SIGKILL) instead of the polite stop (SIGTERM).
     fn stop_selected(&mut self, force: bool, cx: &mut Context<Self>) {
+        self.stop_selected_with(force, true, cx);
+    }
+
+    /// Stops the highlighted process without arming it first, for Delete.
+    fn stop_selected_now(&mut self, force: bool, cx: &mut Context<Self>) {
+        self.stop_selected_with(force, false, cx);
+    }
+
+    fn stop_selected_with(&mut self, force: bool, confirm: bool, cx: &mut Context<Self>) {
         let Some(process) = self.tray.selected_process() else {
             return;
         };
         let (pid, start_time, name) = (process.pid, process.start_time, process.name.clone());
 
-        if self.tray.process_armed != Some(pid) {
+        if confirm && self.tray.process_armed != Some(pid) {
             self.tray.process_armed = Some(pid);
             self.tray.message = None;
             cx.notify();
@@ -1641,7 +1696,7 @@ impl Island {
             .into_any_element()
     }
 
-    /// The overview hub: every panel as an app-like square in a row.
+    /// The overview hub: every panel as a row in a vertical list.
     fn render_overview(
         &self,
         progress: f32,
@@ -1650,59 +1705,57 @@ impl Island {
     ) -> AnyElement {
         let colors = tray_colors(progress, island);
 
-        let squares = OverviewCommand::ALL
+        let rows = OverviewCommand::ALL
             .into_iter()
             .enumerate()
             .map(|(index, command)| {
                 let selected = index == self.overview.selected;
                 let label_color = if selected { colors.text } else { colors.muted };
-                let square_bg = if selected {
-                    colors.selection
-                } else {
-                    colors.border
-                };
 
                 div()
                     .flex()
-                    .flex_col()
+                    .flex_row()
                     .items_center()
-                    .gap_2()
-                    .w(px(128.0))
+                    .justify_between()
+                    .w_full()
+                    .px(px(10.0))
                     .py(px(8.0))
+                    .flex_shrink_0()
                     .rounded_md()
-                    .when(selected, |tile| tile.bg(colors.selection))
+                    .when(selected, |row| row.bg(colors.selection))
                     .child(
-                        // The square itself; its icon is the visual anchor.
+                        // Icon and name form the left group; the hotkey badge is
+                        // pushed to the far right by `justify_between`.
                         div()
                             .flex()
+                            .flex_row()
                             .items_center()
-                            .justify_center()
-                            .w(px(32.0))
-                            .h(px(32.0))
-                            .rounded_sm()
-                            .bg(square_bg)
-                            .border_1()
-                            .border_color(if selected { colors.text } else { colors.border })
+                            .gap_2()
+                            .min_w_0()
                             .child(
                                 div()
+                                    .flex_shrink_0()
                                     .font_family(glyphs::FONT_FAMILY)
-                                    .text_size(px(24.0))
-                                    .line_height(px(30.0))
+                                    .text_size(px(18.0))
+                                    .line_height(px(20.0))
                                     .text_color(colors.text)
                                     .child(command.icon()),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(label_color)
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .min_w_0()
+                                    .child(command.label()),
                             ),
                     )
                     .child(
+                        // Hotkey hint doubles as the shortcut, so the row needs
+                        // no search field to be discoverable.
                         div()
-                            .text_sm()
-                            .text_color(label_color)
-                            .whitespace_nowrap()
-                            .child(command.label()),
-                    )
-                    .child(
-                        // Shortcut hint, so the first-letter behaviour is
-                        // discoverable without reading the footer.
-                        div()
+                            .flex_shrink_0()
                             .px(px(6.0))
                             .rounded_xs()
                             .bg(colors.border)
@@ -1713,7 +1766,7 @@ impl Island {
                     .into_any_element()
             });
 
-        let hint = "←/→ select · Enter open · or press L / T / N · esc close";
+        let hint = "↑/↓ select · Enter open · or press L / T / N · esc close";
 
         let active: Vec<Glyph> = cx.global::<Settings>().glyphs.active().collect();
 
@@ -1729,14 +1782,14 @@ impl Island {
             .child(overview_status(active, colors))
             .child(
                 div()
+                    .id("overview-list")
                     .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_center()
-                    .gap_3()
+                    .flex_col()
+                    .gap_1()
                     .w_full()
                     .flex_1()
-                    .children(squares),
+                    .overflow_y_scroll()
+                    .children(rows),
             )
             .child(tray_footer(None, hint, colors))
             .into_any_element()
@@ -2143,12 +2196,14 @@ impl Island {
 
         let hint = match self.tray.selected_item() {
             Some(item) if item.item_is_menu && item.menu_path.is_some() => {
-                "Enter menu · → opens menu · shift+enter secondary · tab processes · esc close"
+                "Enter menu · Del quit · → opens menu · shift+enter secondary · tab processes · esc close"
             }
             Some(item) if item.menu_path.is_some() => {
-                "Enter activate · → menu · shift+enter secondary · tab processes · esc close"
+                "Enter activate · Del quit · → menu · shift+enter secondary · tab processes · esc close"
             }
-            Some(_) => "Enter activate · shift+enter secondary · tab processes · esc close",
+            Some(_) => {
+                "Enter activate · Del quit · shift+enter secondary · tab processes · esc close"
+            }
             None => "tab processes · esc close",
         };
         let footer = tray_footer(self.tray.message.as_ref(), hint, colors);
@@ -2270,7 +2325,7 @@ impl Island {
         let hint = if self.tray.process_armed.is_some() {
             "Press enter again to stop · shift+enter to force · esc cancels"
         } else {
-            "Enter stops · shift+enter force-stops · tab status items · esc close"
+            "Enter arms stop · shift+enter force · Del stops now · tab items · esc close"
         };
         let footer = tray_footer(self.tray.message.as_ref(), hint, colors);
 

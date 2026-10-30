@@ -131,6 +131,11 @@ enum Command {
         id: i32,
         reply: Sender<Result<(), String>>,
     },
+    Quit {
+        service: String,
+        menu_path: Option<String>,
+        reply: Sender<Result<String, String>>,
+    },
 }
 
 /// Starts the watcher/host thread. Idempotent.
@@ -224,6 +229,22 @@ pub fn invoke_menu(service: &str, menu_path: &str, id: i32) -> Receiver<Result<(
     receiver
 }
 
+/// Asks an item to quit.
+///
+/// The application's own quit action is preferred: clicking the menu entry
+/// lets it save state and prompt the user. Items without a menu, or whose menu
+/// has no recognizable quit entry, fall back to SIGTERM on the process that
+/// owns the item's bus name.
+pub fn quit(service: &str, menu_path: Option<&str>) -> Receiver<Result<String, String>> {
+    let (reply, receiver) = async_channel::bounded(1);
+    send(Command::Quit {
+        service: service.to_string(),
+        menu_path: menu_path.map(str::to_string),
+        reply,
+    });
+    receiver
+}
+
 fn send(command: Command) {
     let Some(service) = SERVICE.get() else {
         return;
@@ -278,6 +299,14 @@ async fn run(shared: Arc<Mutex<State>>, commands: Receiver<Command>) -> zbus::Re
                 reply,
             } => {
                 let result = click_menu(&connection, &service, &menu_path, id).await;
+                let _ = reply.send(result).await;
+            }
+            Command::Quit {
+                service,
+                menu_path,
+                reply,
+            } => {
+                let result = quit_item(&connection, &service, menu_path.as_deref()).await;
                 let _ = reply.send(result).await;
             }
         }
@@ -974,6 +1003,165 @@ fn flatten_menu(node: LayoutNode, depth: usize, entries: &mut Vec<MenuEntry>) {
     }
 }
 
+/// Quits an item through its own menu when possible, otherwise by signalling
+/// the process behind its bus name.
+async fn quit_item(
+    connection: &Connection,
+    service: &str,
+    menu_path: Option<&str>,
+) -> Result<String, String> {
+    let mut menu_error = None;
+
+    if let Some(menu_path) = menu_path {
+        match load_menu(connection, service, menu_path).await {
+            Ok(entries) => match quit_entry(&entries) {
+                Some(entry) => {
+                    let (id, label) = (entry.id, entry.label.clone());
+                    match click_menu(connection, service, menu_path, id).await {
+                        Ok(()) => return Ok(format!("Requested quit via “{label}”")),
+                        Err(err) => {
+                            menu_error = Some(format!("couldn't select “{label}”: {err}"));
+                        }
+                    }
+                }
+                None => menu_error = Some("no recognizable Quit/Exit entry".to_string()),
+            },
+            Err(err) => menu_error = Some(err),
+        }
+    }
+
+    let pid = connection_pid(connection, service).await.map_err(|err| {
+        menu_error
+            .map(|menu_error| format!("no quit action in the menu ({menu_error}); {err}"))
+            .unwrap_or(err)
+    })?;
+
+    crate::process::stop_pid(pid).map_err(|err| format!("couldn't stop pid {pid}: {err}"))?;
+
+    Ok(format!("Sent SIGTERM to pid {pid}"))
+}
+
+/// The PID of the process that owns a bus name.
+///
+/// The D-Bus daemon resolves well-known names to their current owner, so this
+/// is exact and avoids matching on window titles or command lines. Under a
+/// sandbox (Flatpak/Snap) this may name the proxy rather than the application,
+/// which is why the menu action is attempted first.
+async fn connection_pid(connection: &Connection, service: &str) -> Result<u32, String> {
+    let reply = connection
+        .call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus"),
+            "GetConnectionUnixProcessID",
+            &(service,),
+        )
+        .await
+        .map_err(|err| format!("couldn't find the process behind {service}: {err}"))?;
+
+    let pid: u32 = reply
+        .body()
+        .deserialize()
+        .map_err(|err| format!("couldn't read the process id behind {service}: {err}"))?;
+
+    if pid <= 1 || pid == std::process::id() {
+        return Err(format!("refusing to signal pid {pid}"));
+    }
+
+    Ok(pid)
+}
+
+/// Labels used for "quit" in the languages applications commonly ship.
+///
+/// DBusMenu entries have no semantic action id, so the label is the only
+/// signal available. Keep this list to unambiguous quit actions: words like
+/// "stop" or "close" routinely mean something else in a tray menu.
+const QUIT_WORDS: &[&str] = &[
+    "quit",
+    "exit",
+    "beenden",
+    "quitter",
+    "salir",
+    "sair",
+    "esci",
+    "afsluiten",
+    "avsluta",
+    "avslutt",
+    "afslut",
+    "lopeta",
+    "zakończ",
+    "выйти",
+    "выход",
+    "завершить",
+    "終了",
+    "退出",
+    "종료",
+    "çıkış",
+    "ukončit",
+    "έξοδος",
+    "יציאה",
+    "خروج",
+];
+
+/// Finds the menu entry that quits the application.
+fn quit_entry(entries: &[MenuEntry]) -> Option<&MenuEntry> {
+    entries
+        .iter()
+        .filter_map(|entry| quit_score(entry).map(|score| (score, entry)))
+        .min_by_key(|(score, entry)| (std::cmp::Reverse(*score), entry.depth))
+        .map(|(_, entry)| entry)
+}
+
+/// Ranks a menu entry as a quit action, preferring the most explicit label.
+fn quit_score(entry: &MenuEntry) -> Option<u8> {
+    if !entry.enabled {
+        return None;
+    }
+
+    // Qt marks mnemonics with `&`; GTK's `_` is already stripped by
+    // `flatten_menu`. Some labels carry an accelerator after a tab.
+    let label = entry
+        .label
+        .split('\t')
+        .next()
+        .unwrap_or_default()
+        .replace('&', "")
+        .to_lowercase();
+    let label = label
+        .trim()
+        .trim_end_matches(|ch| ch == '.' || ch == '…')
+        .trim();
+
+    // "Exit fullscreen" is a common non-quit action in media players.
+    if label.contains("fullscreen")
+        || label.contains("full screen")
+        || label.contains("full-screen")
+    {
+        return None;
+    }
+
+    QUIT_WORDS
+        .iter()
+        .map(|word| {
+            if label == *word {
+                100
+            } else if label.starts_with(word)
+                && label[word.len()..]
+                    .starts_with(|ch: char| ch.is_whitespace() || ch == '-' || ch == ':')
+            {
+                90
+            } else if label.ends_with(word) {
+                80
+            } else if label.contains(word) {
+                70
+            } else {
+                0
+            }
+        })
+        .max()
+        .filter(|score| *score > 0)
+}
+
 fn string_property(properties: &HashMap<String, OwnedValue>, name: &str) -> Option<String> {
     properties
         .get(name)
@@ -1039,7 +1227,10 @@ mod tests {
 
     use zbus::zvariant::{OwnedObjectPath, OwnedValue, StructureBuilder, Value};
 
-    use super::{ItemStatus, LayoutNode, clean_label, resolve_registration, split_registration};
+    use super::{
+        ItemStatus, LayoutNode, MenuEntry, clean_label, quit_entry, resolve_registration,
+        split_registration,
+    };
 
     #[test]
     fn resolves_bus_name_registrations() {
@@ -1087,6 +1278,69 @@ mod tests {
         assert_eq!(clean_label("_Quit"), "Quit");
         assert_eq!(clean_label("_File"), "File");
         assert_eq!(clean_label("Undo__Redo"), "Undo_Redo");
+    }
+
+    #[test]
+    fn finds_a_quit_entry_by_label() {
+        let entries = vec![
+            entry(1, "Show", true, 0),
+            entry(2, "Quit Discord", true, 0),
+            entry(3, "Settings", true, 0),
+        ];
+        assert_eq!(quit_entry(&entries).map(|entry| entry.id), Some(2));
+    }
+
+    #[test]
+    fn prefers_an_exact_quit_label() {
+        let entries = vec![entry(1, "Exit game", true, 0), entry(2, "Exit", true, 1)];
+        // The exact label outranks the prefix even though it is deeper.
+        assert_eq!(quit_entry(&entries).map(|entry| entry.id), Some(2));
+    }
+
+    #[test]
+    fn ignores_disabled_and_unrelated_actions() {
+        let entries = vec![
+            entry(1, "Quit", false, 0),
+            entry(2, "Stop playback", true, 0),
+            entry(3, "Close window", true, 0),
+        ];
+        assert!(quit_entry(&entries).is_none());
+    }
+
+    #[test]
+    fn recognizes_localized_labels_and_qt_mnemonics() {
+        assert_eq!(
+            quit_entry(&[entry(1, "Beenden", true, 0)]).map(|entry| entry.id),
+            Some(1)
+        );
+        assert_eq!(
+            quit_entry(&[entry(2, "&Quitter", true, 0)]).map(|entry| entry.id),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn does_not_mistake_fullscreen_actions_for_quitting() {
+        let entries = vec![
+            entry(1, "Exit Fullscreen", true, 0),
+            entry(2, "&Quit", true, 0),
+        ];
+        assert_eq!(quit_entry(&entries).map(|entry| entry.id), Some(2));
+    }
+
+    #[test]
+    fn prefers_a_shallow_entry_when_labels_tie() {
+        let entries = vec![entry(1, "Quit", true, 1), entry(2, "Quit", true, 0)];
+        assert_eq!(quit_entry(&entries).map(|entry| entry.id), Some(2));
+    }
+
+    fn entry(id: i32, label: &str, enabled: bool, depth: usize) -> MenuEntry {
+        MenuEntry {
+            id,
+            label: label.to_string(),
+            enabled,
+            depth,
+        }
     }
 
     struct TestItem {
